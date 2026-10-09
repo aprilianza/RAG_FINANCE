@@ -1,0 +1,71 @@
+# ==========================================
+# Datasets, Corpus & Large Files (> 100MB)
+# ==========================================
+dataset/
+corpus/
+embeddings/
+*corpus*
+*embedding*
+
+# Specific Corpus & Embedding data
+*.npy
+*.npz
+*.faiss
+*.index
+*.parquet
+*corpus*.jsonl
+*_details.jsonl
+
+# Archives & Compressed Files
+*.zip
+*.tar.gz
+*.7z
+*.rar
+RAG.zip
+
+# Machine Learning Models & Weights
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+*.pkl
+*.pickle
+
+# Python Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# (Opsional) Seluruh folder outputs jika tidak ingin di-upload ke GitHub:
+# outputs/
+# outputs_allData_heuristic/

@@ -27,7 +27,7 @@ CONFIG = AppConfig(
     sample_seed=42,
     no_progress=False,
     openrouter_endpoint="https://openrouter.ai/api/v1",
-    openrouter_model="openai/gpt-oss-20b:free",
+    openrouter_model="deepseek/deepseek-v4.1-flash",
     openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
     experiment_name="",
 )

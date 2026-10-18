@@ -1,16 +1,12 @@
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
 from typing import Any, Sequence
 
 # ── Optional dependencies — masing-masing blok terpisah ──────────────────────
-
-try:
-    from concurrent.futures import ThreadPoolExecutor, as_completed  # type: ignore[import-not-found]
-except Exception:
-    ThreadPoolExecutor = None
-    as_completed = None
 
 try:
     from rank_bm25 import BM25Okapi  # type: ignore[import-not-found]
@@ -139,8 +135,13 @@ def _load_or_compute_embeddings(
         try:
             print(f"[INFO] Loading cached embeddings from: {cache_path}")
             embeddings = np.load(cache_path)
-            print(f"[INFO] Loaded {len(embeddings)} cached embeddings")
-            return embeddings
+            if len(embeddings) == len(texts):
+                print(f"[INFO] Loaded {len(embeddings)} cached embeddings")
+                return embeddings
+            print(
+                f"[WARN] Cached embeddings count ({len(embeddings)}) != corpus size "
+                f"({len(texts)}), recomputing..."
+            )
         except Exception as e:
             print(f"[WARN] Failed to load embeddings cache: {e}, recomputing...")
 
@@ -188,19 +189,74 @@ def build_bm25(
     return bm25, tokenized_corpus
 
 
+def _top_indices(
+    scores: np.ndarray,
+    k: int,
+    candidate_indices: np.ndarray | None = None,
+) -> list[tuple[int, float]]:
+    """
+    Urutkan skor menurun (tie-break indeks terkecil) dan ambil top-k.
+    Jika candidate_indices diberikan, scores[i] adalah skor candidate_indices[i].
+    """
+    scores = np.asarray(scores, dtype=np.float64)
+    idxs = (
+        np.arange(len(scores))
+        if candidate_indices is None
+        else np.asarray(candidate_indices, dtype=np.int64)
+    )
+    order = np.lexsort((idxs, -scores))[:k]
+    return [(int(idxs[o]), float(scores[o])) for o in order]
+
+
+def _bm25_rank(
+    bm25: Any,
+    query: str,
+    k: int,
+    candidate_indices: np.ndarray | None = None,
+) -> list[tuple[int, float]]:
+    query_tokens = tokenize(query)
+    if candidate_indices is None:
+        scores = bm25.get_scores(query_tokens)
+    else:
+        scores = bm25.get_batch_scores(query_tokens, candidate_indices.tolist())
+    return _top_indices(scores, k, candidate_indices)
+
+
+def _dense_rank(
+    query_vec: np.ndarray,
+    paragraph_embeddings: np.ndarray | None,
+    k: int,
+    faiss_index: Any = None,
+    candidate_indices: np.ndarray | None = None,
+) -> list[tuple[int, float]]:
+    """Cosine similarity (embedding ternormalisasi) vs korpus atau subset kandidat."""
+    query_vec = np.asarray(query_vec, dtype=np.float32).reshape(-1)
+    if candidate_indices is None and faiss_index is not None:
+        scores, indices = faiss_index.search(query_vec[None, :], k)
+        return [
+            (int(idx), float(score))
+            for idx, score in zip(indices[0], scores[0])
+            if idx >= 0
+        ]
+    if paragraph_embeddings is None:
+        raise ValueError("paragraph_embeddings is required for dense retrieval without a FAISS index")
+    if candidate_indices is None:
+        scores = paragraph_embeddings @ query_vec
+    else:
+        scores = paragraph_embeddings[candidate_indices] @ query_vec
+    return _top_indices(scores, k, candidate_indices)
+
+
 def retrieve_topk(
     bm25: Any,
     paragraphs: Sequence[Paragraph],
     query: str,
     k: int = 10,
+    candidate_indices: np.ndarray | None = None,
 ) -> list[tuple[Paragraph, float]]:
-    """Retrieve top-k paragraf menggunakan BM25."""
-    query_tokens = tokenize(query)
-    scores = bm25.get_scores(query_tokens)
-    idx_scores = list(enumerate(scores))
-    idx_scores.sort(key=lambda x: (-x[1], x[0]))
-    top = idx_scores[:k]
-    return [(paragraphs[i], float(s)) for i, s in top]
+    """Retrieve top-k paragraf menggunakan BM25 (opsional dibatasi ke kandidat)."""
+    top = _bm25_rank(bm25, query, k, candidate_indices)
+    return [(paragraphs[i], s) for i, s in top]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,14 +470,14 @@ def retrieve_topk_faiss(
     paragraphs: Sequence[Paragraph],
     query: str,
     k: int = 10,
+    paragraph_embeddings: np.ndarray | None = None,
+    candidate_indices: np.ndarray | None = None,
 ) -> list[tuple[Paragraph, float]]:
-    """Retrieve top-k paragraf menggunakan FAISS dense retrieval."""
-    if faiss is None:
-        raise RuntimeError(
-            "Missing dependency 'faiss'. Install FAISS support before using retrieval_method='faiss'. "
-            "On many setups you can use: pip install faiss-cpu"
-        )
-
+    """
+    Retrieve top-k paragraf menggunakan FAISS dense retrieval.
+    Jika candidate_indices diberikan, pencarian dilakukan langsung pada subset
+    paragraph_embeddings tersebut (exact search, setara IndexFlatIP).
+    """
     query_embedding = _encode_normalized_embeddings(
         embedding_model,
         [query],
@@ -429,15 +485,14 @@ def retrieve_topk_faiss(
     )
 
     top_k = min(k, len(paragraphs))
-    scores, indices = faiss_index.search(query_embedding, top_k)
-
-    results: list[tuple[Paragraph, float]] = []
-    for idx, score in zip(indices[0], scores[0]):
-        if idx < 0:
-            continue
-        results.append((paragraphs[int(idx)], float(score)))
-
-    return results
+    top = _dense_rank(
+        query_embedding[0],
+        paragraph_embeddings,
+        top_k,
+        faiss_index=faiss_index,
+        candidate_indices=candidate_indices,
+    )
+    return [(paragraphs[i], s) for i, s in top]
 
 
 def generate_hypothetical_documents(
@@ -521,6 +576,7 @@ def retrieve_topk_hyde(
     gen_pipeline: Any,
     k: int = 10,
     num_hypothetical_docs: int = 3,
+    candidate_indices: np.ndarray | None = None,
 ) -> tuple[list[tuple[Paragraph, float]], list[str]]:
     """
     Retrieve top-k paragraf menggunakan metode HyDE.
@@ -545,14 +601,37 @@ def retrieve_topk_hyde(
         gen_pipeline:          Pre-loaded LLM pipeline (dari build_hyde_llm).
         k:                     Jumlah hasil yang dikembalikan.
         num_hypothetical_docs: Jumlah hypothetical docs (paper FinSage: 3).
+        candidate_indices:     Opsional, batasi pencarian ke subset paragraf.
 
     Returns:
         Tuple of:
           - list[(Paragraph, similarity_score)] : top-k paragraf
           - list[str]                           : hypothetical docs (untuk debug)
     """
-    from sklearn.metrics.pairwise import cosine_similarity  # lazy import
+    query_vec, hypothetical_docs = _hyde_query_vector(
+        embedding_model,
+        query,
+        gen_pipeline=gen_pipeline,
+        num_hypothetical_docs=num_hypothetical_docs,
+    )
 
+    # 4-5. Cosine similarity (dot product vektor ternormalisasi) lalu top-k
+    top = _dense_rank(
+        query_vec,
+        paragraph_embeddings,
+        k,
+        candidate_indices=candidate_indices,
+    )
+    return [(paragraphs[i], s) for i, s in top], hypothetical_docs
+
+
+def _hyde_query_vector(
+    embedding_model: Any,
+    query: str,
+    gen_pipeline: Any,
+    num_hypothetical_docs: int = 3,
+) -> tuple[np.ndarray, list[str]]:
+    """Generate hypothetical docs lalu kembalikan mean embedding ternormalisasi."""
     # 1. Generate hypothetical documents
     print(f"[INFO] Generating {num_hypothetical_docs} hypothetical documents...")
     hypothetical_docs = generate_hypothetical_documents(
@@ -585,159 +664,74 @@ def retrieve_topk_hyde(
     if norm > 0:
         mean_hypothesis_embedding = mean_hypothesis_embedding / norm
 
-    # 4. Cosine similarity vs seluruh corpus
-    scores = cosine_similarity(
-        [mean_hypothesis_embedding],
-        paragraph_embeddings,
-    )[0]
-
-    # 5. Sort dan ambil top-k
-    idx_scores = list(enumerate(scores))
-    idx_scores.sort(key=lambda x: (-x[1], x[0]))
-    top = idx_scores[:k]
-
-    return [(paragraphs[i], float(s)) for i, s in top], hypothetical_docs
+    return np.asarray(mean_hypothesis_embedding, dtype=np.float32), hypothetical_docs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Multi-Path Retrieval (MPR) — BM25 + FAISS + HyDE
+# Multi-Path Retrieval (MPR) — BM25 + FAISS + HyDE dengan RRF
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _deduplicate_results(
-    results: list[tuple[Paragraph, float, str]],
-) -> list[tuple[Paragraph, float, list[str]]]:
+def _rrf_fuse(
+    ranked_lists: dict[str, list[tuple[int, float]]],
+    rrf_k: int = 60,
+) -> list[tuple[int, float, list[str]]]:
     """
-    Hapus duplikat berdasarkan paragraph_id.
-    Jika ada duplikat, pertahankan score tertinggi dan track semua source retriever.
+    Reciprocal Rank Fusion: skor = sum(1 / (rrf_k + rank)) dari tiap retriever.
 
-    Args:
-        results: List of (Paragraph, score, source_method)
+    RRF hanya memakai peringkat, sehingga skor BM25 (puluhan) dan cosine
+    (0-1) tidak perlu dinormalisasi agar bisa digabung secara adil.
 
     Returns:
-        List of (Paragraph, max_score, [all_sources])
+        List of (paragraph_index, rrf_score, [sources]) urut menurun.
     """
-    seen: dict[str, tuple[Paragraph, float, list[str]]] = {}
-
-    for para, score, source in results:
-        para_id = para.paragraph_id
-        if para_id not in seen:
-            seen[para_id] = (para, score, [source])
-        else:
-            _, max_score, sources = seen[para_id]
-            new_score = max(max_score, score)
-            if source not in sources:
-                sources.append(source)
-            seen[para_id] = (para, new_score, sources)
-
-    return [
-        (para, score, sources)
-        for para, score, sources in seen.values()
-    ]
+    fused: dict[int, float] = {}
+    sources: dict[int, list[str]] = {}
+    for source, ranked in ranked_lists.items():
+        for rank, (idx, _) in enumerate(ranked, start=1):
+            fused[idx] = fused.get(idx, 0.0) + 1.0 / (rrf_k + rank)
+            sources.setdefault(idx, []).append(source)
+    order = sorted(fused, key=lambda i: (-fused[i], i))
+    return [(i, fused[i], sources[i]) for i in order]
 
 
-def _expand_chunks_with_bundling(
-    deduplicated: list[tuple[Paragraph, float, list[str]]],
+def _bundle_neighbors(
+    anchor_idx: int,
     paragraphs: Sequence[Paragraph],
-    embedding_model: Any,
+    paragraph_embeddings: np.ndarray,
+    used: set[int],
     similarity_threshold: float = 0.85,
     max_neighbors: int = 5,
-) -> list[tuple[Paragraph, float, list[str], list[str]]]:
+) -> list[int]:
     """
-    Chunk Expansion: Untuk setiap chunk yang dikembalikan, cek chunk tetangga 
-    (sebelum dan sesudah) di dokumen asli dan gabungkan jika similaritasnya
-    melebihi threshold.
-
-    Returns:
-        List of (bundled_Paragraph, original_score, sources, neighbor_ids)
+    Chunk Expansion: perluas chunk ke tetangga sebelum/sesudah di dokumen yang
+    sama selama cosine similarity dengan chunk anchor > threshold.
+    Ekspansi berhenti pada tetangga pertama yang di bawah threshold agar teks
+    gabungan tetap kontigu. Tetangga yang sudah dipakai bundle lain dilewati.
     """
-    if not deduplicated:
-        return []
-
-    # Build mapping: source_file -> list of (paragraph_id, index)
-    doc_paragraphs: dict[str, list[tuple[str, int]]] = {}
-    for idx, para in enumerate(paragraphs):
-        if para.source_file not in doc_paragraphs:
-            doc_paragraphs[para.source_file] = []
-        doc_paragraphs[para.source_file].append((para.paragraph_id, idx))
-
-    bundled_results: list[tuple[Paragraph, float, list[str], list[str]]] = []
-
-    for para, score, sources in deduplicated:
-        neighbor_texts: list[str] = [para.text]
-        neighbor_ids: list[str] = [para.paragraph_id]
-
-        # Cari posisi chunk ini di dokumen asli
-        if para.source_file in doc_paragraphs:
-            para_list = doc_paragraphs[para.source_file]
-            try:
-                current_pos = next(
-                    i for i, (pid, _) in enumerate(para_list)
-                    if pid == para.paragraph_id
-                )
-
-                # Query embedding untuk similarity check
-                query_embedding = _encode_normalized_embeddings(
-                    embedding_model,
-                    [para.text],
-                    show_progress_bar=False,
-                )
-                query_vec = query_embedding[0]
-
-                # Cek neighbors sebelum dan sesudah
-                neighbors_to_check = []
-                for offset in range(1, max_neighbors + 1):
-                    if current_pos - offset >= 0:
-                        neighbors_to_check.append(
-                            (current_pos - offset, "before")
-                        )
-                    if current_pos + offset < len(para_list):
-                        neighbors_to_check.append(
-                            (current_pos + offset, "after")
-                        )
-
-                for neighbor_pos, direction in neighbors_to_check:
-                    neighbor_id, neighbor_idx = para_list[neighbor_pos]
-                    neighbor_para = paragraphs[neighbor_idx]
-
-                    # Compute similarity
-                    neighbor_embedding = _encode_normalized_embeddings(
-                        embedding_model,
-                        [neighbor_para.text],
-                        show_progress_bar=False,
-                    )
-                    neighbor_vec = neighbor_embedding[0]
-
-                    # Cosine similarity (inner product of normalized vectors)
-                    similarity = float(np.dot(query_vec, neighbor_vec))
-
-                    if similarity > similarity_threshold:
-                        if direction == "before":
-                            neighbor_texts.insert(0, neighbor_para.text)
-                            neighbor_ids.insert(0, neighbor_id)
-                        else:
-                            neighbor_texts.append(neighbor_para.text)
-                            neighbor_ids.append(neighbor_id)
-
-            except StopIteration:
-                pass
-
-        # Gabungkan teks dari neighbor menjadi satu bundled paragraph
-        bundled_text = " ".join(neighbor_texts)
-        bundled_para = Paragraph(
-            paragraph_id=para.paragraph_id,
-            source_file=para.source_file,
-            text=bundled_text,
-        )
-
-        bundled_results.append((bundled_para, score, sources, neighbor_ids))
-
-    return bundled_results
+    anchor_vec = paragraph_embeddings[anchor_idx]
+    source_file = paragraphs[anchor_idx].source_file
+    bundle = [anchor_idx]
+    for step in (-1, 1):
+        for offset in range(1, max_neighbors + 1):
+            n = anchor_idx + step * offset
+            if n < 0 or n >= len(paragraphs) or n in used:
+                break
+            if paragraphs[n].source_file != source_file:
+                break
+            if float(np.dot(anchor_vec, paragraph_embeddings[n])) <= similarity_threshold:
+                break
+            if step < 0:
+                bundle.insert(0, n)
+            else:
+                bundle.append(n)
+    return bundle
 
 
 def retrieve_multipath(
     bm25: Any,
     embedding_model: Any,
     faiss_index: Any,
+    paragraph_embeddings: np.ndarray,
     paragraphs: Sequence[Paragraph],
     query: str,
     gen_pipeline: Any = None,
@@ -745,112 +739,103 @@ def retrieve_multipath(
     hyde_num_hypothetical_docs: int = 3,
     similarity_threshold: float = 0.85,
     max_neighbors: int = 5,
-) -> list[tuple[Paragraph, float]]:
+    candidate_indices: np.ndarray | None = None,
+    candidates_per_retriever: int = 30,
+    rrf_k: int = 60,
+) -> tuple[list[tuple[Paragraph, float]], list[str]]:
     """
-    Multi-Path Retrieval (MPR): Menjalankan BM25, FAISS, dan HyDE secara paralel,
-    menggabungkan hasil, menghapus duplikat, lalu melakukan chunk expansion/bundling.
+    Multi-Path Retrieval (MPR): BM25, FAISS, dan HyDE dijalankan paralel,
+    hasilnya digabung dengan Reciprocal Rank Fusion (RRF), lalu top-k chunk
+    diperluas dengan chunk bundling.
 
     Args:
         bm25:                     BM25 index.
         embedding_model:          Sentence Transformer model.
-        faiss_index:              FAISS index.
+        faiss_index:              FAISS index (dipakai saat tanpa filter kandidat).
+        paragraph_embeddings:     Embedding korpus ternormalisasi.
         paragraphs:               Corpus paragraf.
         query:                    Query string.
-        gen_pipeline:             HyDE LLM pipeline (optional).
-        k:                        Top-k hasil per metode retriever.
+        gen_pipeline:             HyDE LLM pipeline (None = jalur HyDE dilewati).
+        k:                        Jumlah hasil akhir.
         hyde_num_hypothetical_docs: Jumlah hypothetical docs untuk HyDE.
         similarity_threshold:     Threshold untuk chunk bundling.
-        max_neighbors:            Maksimal neighbor yang dicek per chunk.
+        max_neighbors:            Maksimal neighbor yang dicek per arah.
+        candidate_indices:        Opsional, batasi semua retriever ke subset paragraf.
+        candidates_per_retriever: Jumlah kandidat per retriever sebelum fusion.
+        rrf_k:                    Konstanta RRF.
 
     Returns:
-        List of (Paragraph dengan bundled text, combined_score)
+        Tuple of:
+          - list[(Paragraph dengan bundled text, rrf_score)]
+          - list[str] hypothetical docs dari jalur HyDE
     """
-    all_results: list[tuple[Paragraph, float, str]] = []
+    n = max(k, candidates_per_retriever)
+    hypothetical_docs: list[str] = []
 
-    # 1. Jalankan ketiga retriever secara paralel (atau berurutan jika executor tidak tersedia)
-    print(f"[INFO] Running multi-path retrieval (BM25 + FAISS + HyDE)...")
+    def _bm25() -> list[tuple[int, float]]:
+        return _bm25_rank(bm25, query, n, candidate_indices)
 
-    def _bm25_retrieve() -> list[tuple[Paragraph, float, str]]:
-        try:
-            topk = retrieve_topk(bm25, paragraphs, query, k=k)
-            return [(para, score, "BM25") for para, score in topk]
-        except Exception as e:
-            print(f"[WARN] BM25 retrieval failed: {e}")
-            return []
+    def _faiss() -> list[tuple[int, float]]:
+        query_vec = _encode_normalized_embeddings(embedding_model, [query], show_progress_bar=False)[0]
+        return _dense_rank(query_vec, paragraph_embeddings, n, faiss_index, candidate_indices)
 
-    def _faiss_retrieve() -> list[tuple[Paragraph, float, str]]:
-        try:
-            topk = retrieve_topk_faiss(embedding_model, faiss_index, paragraphs, query, k=k)
-            return [(para, score, "FAISS") for para, score in topk]
-        except Exception as e:
-            print(f"[WARN] FAISS retrieval failed: {e}")
-            return []
+    def _hyde() -> list[tuple[int, float]]:
+        query_vec, docs = _hyde_query_vector(
+            embedding_model,
+            query,
+            gen_pipeline=gen_pipeline,
+            num_hypothetical_docs=hyde_num_hypothetical_docs,
+        )
+        hypothetical_docs.extend(docs)
+        return _dense_rank(query_vec, paragraph_embeddings, n, faiss_index, candidate_indices)
 
-    def _hyde_retrieve() -> list[tuple[Paragraph, float, str]]:
-        try:
-            topk, _ = retrieve_topk_hyde(
-                embedding_model,
-                None,
-                paragraphs,
-                query,
-                gen_pipeline=gen_pipeline,
-                k=k,
-                num_hypothetical_docs=hyde_num_hypothetical_docs,
-            )
-            return [(para, score, "HyDE") for para, score in topk]
-        except Exception as e:
-            print(f"[WARN] HyDE retrieval failed: {e}")
-            return []
+    # 1. Jalankan retriever secara paralel
+    jobs = {"BM25": _bm25, "FAISS": _faiss}
+    if gen_pipeline is not None:
+        jobs["HyDE"] = _hyde
 
-    # Try parallel execution first
-    if ThreadPoolExecutor is not None:
-        try:
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                futures = {
-                    executor.submit(_bm25_retrieve): "BM25",
-                    executor.submit(_faiss_retrieve): "FAISS",
-                    executor.submit(_hyde_retrieve): "HyDE",
-                }
-                for future in as_completed(futures):
-                    try:
-                        results = future.result()
-                        all_results.extend(results)
-                    except Exception as e:
-                        print(f"[WARN] Parallel retrieval failed: {e}")
-        except Exception as e:
-            print(f"[WARN] Parallel execution not available, falling back to sequential: {e}")
-            # Fallback ke sequential
-            all_results.extend(_bm25_retrieve())
-            all_results.extend(_faiss_retrieve())
-            all_results.extend(_hyde_retrieve())
-    else:
-        # Fallback ke sequential jika ThreadPoolExecutor tidak tersedia
-        all_results.extend(_bm25_retrieve())
-        all_results.extend(_faiss_retrieve())
-        all_results.extend(_hyde_retrieve())
+    ranked_lists: dict[str, list[tuple[int, float]]] = {}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        futures = {executor.submit(fn): name for name, fn in jobs.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                ranked_lists[name] = future.result()
+            except Exception as e:
+                print(f"[WARN] {name} retrieval failed: {e}")
 
-    if not all_results:
+    if not ranked_lists:
         print("[WARN] No results from any retriever, returning empty list")
-        return []
+        return [], hypothetical_docs
 
-    print(f"[INFO] Collected {len(all_results)} results from multi-path retrieval")
+    # 2. Fusion berbasis peringkat (sekaligus deduplikasi per paragraf)
+    fused = _rrf_fuse({name: ranked_lists[name] for name in jobs if name in ranked_lists}, rrf_k=rrf_k)
 
-    # 2. Deduplicate berdasarkan paragraph_id
-    deduplicated = _deduplicate_results(all_results)
-    print(f"[INFO] After deduplication: {len(deduplicated)} unique chunks")
+    # 3. Chunk bundling untuk top-k; anchor yang sudah terserap bundle lain dilewati
+    used: set[int] = set()
+    results: list[tuple[Paragraph, float]] = []
+    for idx, score, _ in fused:
+        if len(results) >= k:
+            break
+        if idx in used:
+            continue
+        bundle = _bundle_neighbors(
+            idx,
+            paragraphs,
+            paragraph_embeddings,
+            used,
+            similarity_threshold=similarity_threshold,
+            max_neighbors=max_neighbors,
+        )
+        used.update(bundle)
+        anchor = paragraphs[idx]
+        results.append((
+            Paragraph(
+                paragraph_id=anchor.paragraph_id,
+                source_file=anchor.source_file,
+                text=" ".join(paragraphs[i].text for i in bundle),
+            ),
+            score,
+        ))
 
-    # 3. Chunk expansion/bundling dengan similarity threshold
-    bundled = _expand_chunks_with_bundling(
-        deduplicated,
-        paragraphs,
-        embedding_model,
-        similarity_threshold=similarity_threshold,
-        max_neighbors=max_neighbors,
-    )
-    print(f"[INFO] After chunk bundling: {len(bundled)} bundled chunks")
-
-    # 4. Sort by score dan kembalikan top-k
-    bundled.sort(key=lambda x: (-x[1], x[0].paragraph_id))
-    topk = bundled[:k]
-
-    return [(para, score) for para, score, _, _ in topk]
+    return results, hypothetical_docs

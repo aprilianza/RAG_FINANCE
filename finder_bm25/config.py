@@ -5,6 +5,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List
 
+# Naikkan jika format korpus berubah agar cache korpus & embedding lama tidak terpakai.
+# v2: tabel 10-K disimpan sebagai teks (sebelumnya dibuang).
+CORPUS_VERSION = "v2"
+
 
 def load_env(env_path: Path | None = None) -> None:
     """Load key-value pairs from .env into os.environ if not already set."""
@@ -56,6 +60,12 @@ class AppConfig:
     # Chunk bundling config (for multipath retrieval)
     chunk_expansion_similarity_threshold: float = 0.85
     chunk_expansion_max_neighbors: int = 5
+    # Reciprocal Rank Fusion (multipath)
+    rrf_k: int = 60
+    multipath_candidates_per_retriever: int = 30
+
+    # Batasi retrieval ke perusahaan yang disebut di query (ticker / nama).
+    company_filter: bool = False
 
     # Eval config
     eval_mode: str = "heuristic"  # heuristic | ragas_llm | ragas_nonllm
@@ -104,20 +114,24 @@ class AppConfig:
 
     @property
     def corpus_cache_path(self) -> Path:
-        return self.output_dir / "corpus_paragraphs.jsonl"
+        return self.output_dir / f"corpus_paragraphs_{CORPUS_VERSION}.jsonl"
+
+    @property
+    def company_names_cache_path(self) -> Path:
+        return self.output_dir / "company_names.json"
 
     @property
     def faiss_embeddings_cache_path(self) -> Path:
         """Cache path untuk FAISS embeddings (numpy format)."""
         # Encode model name untuk avoid path issues (ganti '/' dengan '_')
         model_safe = self.embedding_model.replace("/", "_").replace("-", "_")
-        return self.output_dir / f"faiss_embeddings_{model_safe}.npy"
+        return self.output_dir / f"faiss_embeddings_{model_safe}_{CORPUS_VERSION}.npy"
 
     @property
     def hyde_embeddings_cache_path(self) -> Path:
         """Cache path untuk HyDE embeddings (numpy format)."""
         model_safe = self.embedding_model.replace("/", "_").replace("-", "_")
-        return self.output_dir / f"hyde_embeddings_{model_safe}.npy"
+        return self.output_dir / f"hyde_embeddings_{model_safe}_{CORPUS_VERSION}.npy"
 
     @property
     def retrieval_details_path(self) -> Path:
@@ -145,3 +159,7 @@ def validate_config(config: AppConfig) -> None:
         raise ValueError("chunk_expansion_similarity_threshold must be between 0.0 and 1.0")
     if config.chunk_expansion_max_neighbors <= 0:
         raise ValueError("chunk_expansion_max_neighbors must be > 0")
+    if config.rrf_k <= 0:
+        raise ValueError("rrf_k must be > 0")
+    if config.multipath_candidates_per_retriever <= 0:
+        raise ValueError("multipath_candidates_per_retriever must be > 0")

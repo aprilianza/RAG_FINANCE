@@ -41,14 +41,15 @@ Secara garis besar, alur program adalah:
 
 ```text
 .
-├── finder_bm25_recall.py         # Launcher kompatibel lama
+├── main.py                       # Launcher kompatibel lama
 ├── run_finder_bm25.py            # Entrypoint utama pipeline
 ├── finder_bm25/                  # Paket modular pipeline
 │   ├── config.py                 # Definisi AppConfig dan validasi
 │   ├── settings.py               # Konfigurasi default global
 │   ├── data.py                   # Load data train dan sampling
 │   ├── preprocess.py             # Parsing HTML 10-K menjadi paragraf
-│   ├── retrieval.py              # BM25 dan HyDE retrieval
+│   ├── retrieval.py              # BM25, HyDE, FAISS, dan Multipath (RRF) retrieval
+│   ├── company.py                # Deteksi perusahaan di query + filter korpus per perusahaan
 │   ├── evaluation.py             # Metrik context recall
 │   ├── pipeline.py               # Orkestrasi end-to-end
 │   └── utils.py                  # Utilitas umum
@@ -139,11 +140,30 @@ Folder ini berisi file HTML 10-K perusahaan, misalnya `AAPL.html`, `AMZN.html`, 
 
 Saat pipeline dijalankan, file HTML 10-K akan diproses menjadi paragraf teks:
 
-- Tag seperti `script`, `style`, `table`, dan elemen XBRL tertentu dibuang.
+- Tag seperti `script`, `style`, dan elemen XBRL tersembunyi dibuang.
+- Tabel **disimpan** sebagai teks per baris (`label | $8,259 | 52% ; baris berikutnya`). Simbol `$`, `%`, dan `( )` yang terpisah di sel sendiri digabung kembali ke angkanya. Tabel panjang dipecah per baris dengan header diulang di tiap chunk.
 - Teks dibersihkan dari spasi berlebih.
 - Paragraf terlalu panjang akan dipecah menjadi chunk yang lebih kecil.
 - Paragraf duplikat dan noise disaring.
-- Hasilnya disimpan ke cache `outputs/corpus_paragraphs.jsonl`.
+- Hasilnya disimpan ke cache `outputs/corpus_paragraphs_v2.jsonl`.
+
+Sufiks `v2` (`CORPUS_VERSION` di `finder_bm25/config.py`) menandai format korpus. Cache lama `corpus_paragraphs.jsonl` (tanpa tabel) tidak dipakai lagi, sehingga run pertama setelah update akan mem-parsing ulang semua HTML dan menghitung ulang embedding.
+
+## Filter Perusahaan (ablation, default off)
+
+Secara default retrieval dilakukan di **seluruh korpus**, sama seperti baseline di paper FINDER (Tabel 4) dan shared vector store di FinSage. Hanya setting ini yang sebanding dengan angka di kedua paper.
+
+Filter perusahaan adalah setting ablation ("company routing") yang diaktifkan dengan `--company-filter`. Filter ini tidak memakai ground truth, hanya teks query dan korpus. Namun hasilnya tidak sebanding dengan baseline FINDER, dan aturan ticker ambigu disusun sambil melihat query evaluasi, jadi laporkan sebagai ablation terpisah.
+
+Query FINDER hampir selalu menyebut satu perusahaan (ticker seperti `AMAT`, `MCK`, atau nama seperti `Hormel Foods`). Jika filter aktif, retrieval hanya dilakukan pada paragraf 10-K milik perusahaan yang terdeteksi:
+
+- Ticker dicocokkan dengan nama file 10-K (`AMAT.html` → `AMAT`).
+- Nama perusahaan diambil dari tag inline XBRL `dei:EntityRegistrantName` dan di-cache ke `outputs/company_names.json`.
+- Ticker pendek atau yang mirip singkatan (`A`, `D`, `IT`, `CF`, `ON`, ...) hanya diterima jika muncul dalam pola eksplisit, misalnya `(ON)`, `MCK's`, `F:`, `ticker EA`, atau di akhir query. Bagian dari singkatan seperti `D&A`, `R&D`, `D/E` diabaikan.
+- Jika beberapa perusahaan disebut (mis. `LUV vs DAL, UAL`), paragraf semua perusahaan tersebut dipakai.
+- Jika tidak ada perusahaan yang terdeteksi, retrieval kembali ke seluruh korpus.
+
+Perusahaan yang terdeteksi dan apakah filter diterapkan dicatat per query di file `_retrieval_details.jsonl` (`detected_companies`, `company_filter_applied`).
 
 Jika file cache ini sudah ada, pipeline akan memuat cache tersebut daripada parsing ulang semua HTML.
 
@@ -151,15 +171,15 @@ Jika file cache ini sudah ada, pipeline akan memuat cache tersebut daripada pars
 
 Untuk retrieval method **HyDE** dan **FAISS**, embeddings dari seluruh corpus (~494K paragraphs) di-compute dan **otomatis disimpan ke cache** di folder `outputs/`:
 
-- **FAISS embeddings**: `outputs/faiss_embeddings_<model_name>.npy`
-- **HyDE embeddings**: `outputs/hyde_embeddings_<model_name>.npy`
+- **FAISS embeddings**: `outputs/faiss_embeddings_<model_name>_v2.npy`
+- **HyDE embeddings**: `outputs/hyde_embeddings_<model_name>_v2.npy`
 
 Caching dilakukan otomatis:
 
 1. **First run**: Embeddings dihitung dan disimpan ke `.npy` file (sekali saja).
 2. **Subsequent runs**: Embeddings dimuat langsung dari cache, menghemat waktu computation secara signifikan.
 
-Cache path dihasilkan berdasarkan nama model embedding yang dipakai (e.g., `BAAI/bge-base-en-v1.5` menjadi `baai_bge_base_en_v1_5.npy`).
+Cache path dihasilkan berdasarkan nama model embedding dan versi korpus (e.g., `BAAI/bge-base-en-v1.5` menjadi `faiss_embeddings_BAAI_bge_base_en_v1.5_v2.npy`). Jika jumlah embedding di cache tidak sama dengan jumlah paragraf korpus, embedding dihitung ulang otomatis.
 
 Jika ingin regenerate embeddings cache (misal ganti embedding model), cukup hapus file `.npy` yang sesuai di folder `outputs/`.
 
@@ -168,7 +188,8 @@ Jika ingin regenerate embeddings cache (misal ganti embedding model), cukup hapu
 Ada dua file yang bisa dipakai untuk menjalankan pipeline:
 
 - `run_finder_bm25.py` -> entrypoint utama yang direkomendasikan.
-- `finder_bm25_recall.py` -> launcher kompatibel lama yang memanggil `run_finder_bm25.py`.
+- `run_baselines.py` -> menjalankan BM25, FAISS, HyDE, dan Multipath dengan konfigurasi, korpus, sampel, dan judge yang sama, lalu menulis `comparison.md` dan `comparison.csv`.
+- `main.py` -> launcher kompatibel lama yang memanggil `run_finder_bm25.py`.
 
 ## Konfigurasi Default
 
@@ -176,13 +197,16 @@ Konfigurasi default berada di `finder_bm25/settings.py`.
 
 Saat ini default yang dipakai adalah:
 
-- `retrieval_method = "hyde"`
-- `retrieval_method = "hyde"` atau `"faiss"` jika ingin dense retrieval
+- `retrieval_method = "bm25"` (pilihan: `bm25`, `hyde`, `faiss`, `multipath`)
 - `embedding_model = "BAAI/bge-base-en-v1.5"`
 - `hyde_llm_model = "Qwen/Qwen2.5-7B-Instruct"`
 - `hyde_device = "cuda"`
 - `hyde_num_hypothetical_docs = 3`
-- `eval_mode = "heuristic"`
+- `eval_mode = "ragas_llm"`
+- `openrouter_model = "deepseek/deepseek-v4.1-flash"`
+- `company_filter = False` (full corpus; `True` hanya untuk ablation)
+- `rrf_k = 60`
+- `multipath_candidates_per_retriever = 30`
 - `sample_percent = 10.0`
 - `sample_seed = 42`
 - `top_k = 10`
@@ -278,9 +302,27 @@ Berikut argumen yang bisa dipakai melalui `run_finder_bm25.py`:
 - `--chunk-expansion-similarity-threshold`
   - Similarity threshold untuk chunk bundling dalam multipath retrieval (default: 0.85).
 - `--chunk-expansion-max-neighbors`
-  - Maksimal tetangga yang dicek untuk chunk bundling dalam multipath retrieval (default: 5).
+  - Maksimal tetangga yang dicek per arah untuk chunk bundling dalam multipath retrieval (default: 5).
+- `--rrf-k`
+  - Konstanta Reciprocal Rank Fusion untuk multipath retrieval (default: 60).
+- `--multipath-candidates`
+  - Jumlah kandidat per retriever sebelum fusion dalam multipath retrieval (default: 30).
+- `--company-filter` / `--no-company-filter`
+  - Aktifkan (ablation) atau nonaktifkan filter perusahaan. Default nonaktif.
+
+## Menjalankan Ulang Semua Baseline
+
+Setelah korpus berubah (misalnya `corpus_paragraphs_v2.jsonl` yang kini berisi tabel), semua metode harus dijalankan ulang di korpus, sampel, dan judge yang sama:
+
+```powershell
+python run_baselines.py --experiment-name baselines_v2
+```
+
+Semua run disimpan di `outputs/baselines_v2/`, plus `comparison.md` dan `comparison.csv`. Opsi lain dari `run_finder_bm25.py` tetap berlaku (mis. `--sample-percent`, `--openrouter-model`, `--company-filter`). Pilih subset metode dengan `--methods bm25 faiss`. Untuk ablation filter perusahaan, jalankan sekali lagi dengan `--company-filter --experiment-name baselines_v2_company`.
 
 ## Mode Evaluasi
+
+Apa pun mode yang dipilih, skor `heuristic` selalu ikut dihitung sebagai pembanding deterministik. Skornya muncul sebagai kolom tambahan di `.md` dan `.csv`, dan sebagai `heuristic_score` per query di `_retrieval_details.jsonl`. Header file `.md` mencatat evaluator (termasuk model judge), status filter perusahaan, versi korpus, dan ukuran sampel.
 
 ### 1. `heuristic`
 
@@ -296,9 +338,11 @@ Ini adalah mode paling ringan dan cocok untuk eksperimen cepat.
 
 Mode ini memakai metrik `NonLLMContextRecall` dari `ragas`.
 
-Jika mode ini gagal pada salah satu query, pipeline akan fallback ke `heuristic`.
+Jika mode ini gagal pada salah satu query, pipeline berhenti dengan error (tidak ada fallback).
 
 ### 3. `ragas_llm`
+
+**Pakai satu model judge yang sama untuk semua run yang dibandingkan.** Pada konteks retrieval yang identik, skor bisa berubah dari 71.47 (`openai/gpt-oss-20b:free`) ke 8.40 (`deepseek/deepseek-v4.1-flash`). Model judge default ada di `openrouter_model` pada `finder_bm25/settings.py`. API key tidak ditulis ke `_config.json`.
 
 Mode ini memakai evaluasi LLM melalui OpenRouter dan `ragas`.
 
@@ -308,7 +352,7 @@ Mode ini membutuhkan:
 - API key OpenRouter
 - paket `ragas`, `datasets`, dan `langchain-openai`
 
-Jika evaluasi LLM gagal, pipeline juga fallback ke `heuristic`.
+Jika evaluasi LLM gagal, pipeline mencoba ulang hingga 3 kali lalu berhenti dengan error (tidak ada fallback ke `heuristic`).
 
 ### 4. `faiss`
 
@@ -352,17 +396,16 @@ FAISS di proyek ini dipakai sebagai dense retriever. Alurnya:
 
 ### Multipath Retrieval (MPR)
 
-MPR menggabungkan kekuatan BM25, FAISS, dan HyDE dengan proses deduplication dan chunk bundling:
+MPR menggabungkan kekuatan BM25, FAISS, dan HyDE dengan Reciprocal Rank Fusion (RRF) dan chunk bundling:
 
-1. **Parallelisasi**: Ketiga retriever (BM25, FAISS, HyDE) dijalankan secara paralel untuk setiap query.
-2. **Penggabungan Hasil**: Hasil dari ketiga retriever digabungkan dalam satu collection.
-3. **Deduplication**: Chunk duplikat (berdasarkan paragraph_id) dihapus, skor tertinggi dipertahankan, dan source retriever dilacak.
-4. **Chunk Expansion/Bundling**:
-   - Untuk setiap chunk yang dikembalikan, sistem memeriksa chunk tetangga sebelum dan sesudahnya di dokumen asli.
-   - Jika cosine similarity dari dense embedding melebihi threshold 0.85, chunk tetangga digabungkan.
-   - Maksimal 5 tetangga dicek (di kedua arah).
-   - Teks dari bundled chunks digabungkan menjadi satu chunk yang diperluas.
-5. **Hasil Akhir**: Chunk yang sudah di-bundle diurutkan berdasarkan score dan diambil top-k untuk evaluasi.
+1. **Parallelisasi**: Ketiga retriever (BM25, FAISS, HyDE) dijalankan secara paralel untuk setiap query. Masing-masing mengambil `multipath_candidates_per_retriever` kandidat (default 30), dibatasi ke perusahaan target jika filter perusahaan aktif.
+2. **Fusion dengan RRF**: Skor akhir tiap paragraf adalah `sum(1 / (rrf_k + rank))` dari setiap retriever yang menemukannya. RRF hanya memakai peringkat, jadi skor BM25 (puluhan) dan cosine (0-1) tidak perlu dinormalisasi. Paragraf yang ditemukan beberapa retriever otomatis naik peringkat dan sekaligus terdeduplikasi.
+3. **Chunk Expansion/Bundling** (hanya untuk top-k hasil fusion):
+   - Chunk tetangga sebelum dan sesudah di dokumen yang sama digabungkan selama cosine similarity-nya dengan chunk anchor melebihi threshold (default 0.85).
+   - Ekspansi berhenti pada tetangga pertama di bawah threshold agar teks tetap kontigu, maksimal 5 tetangga per arah.
+   - Similarity dihitung dari embedding korpus yang sudah di-cache (tanpa encode ulang).
+   - Chunk yang sudah terserap bundle dengan peringkat lebih tinggi tidak dipakai lagi, sehingga top-k tidak berisi teks yang tumpang tindih.
+4. **Hasil Akhir**: Top-k bundle diurutkan berdasarkan skor RRF. Hypothetical documents dari jalur HyDE ikut disimpan di `_retrieval_details.jsonl`.
 
 MPR cocok untuk queries yang kompleks dan ambigu karena menggabungkan perspektif lexical, dense, dan generatif.
 
@@ -505,7 +548,7 @@ Pastikan:
 - Endpoint OpenRouter benar.
 - Paket `ragas`, `datasets`, dan `langchain-openai` tersedia.
 
-Jika tetap gagal, pipeline akan fallback ke heuristic untuk query tersebut.
+Jika tetap gagal setelah 3 kali percobaan, pipeline berhenti dengan error pada query tersebut.
 
 ### 6. Hasil terlalu lambat
 
@@ -526,13 +569,14 @@ Beberapa cara mempercepat run:
 - `finder_bm25/pipeline.py` adalah orkestrator utama end-to-end yang mendukung dispatch ke BM25, HyDE, FAISS, dan Multipath.
   - Pass `cache_path` ke `build_faiss_retriever()` dan `build_hyde_retriever()` untuk otomatis caching.
 - `finder_bm25/preprocess.py` membangun cache korpus dari HTML 10-K.
+- `finder_bm25/company.py` memuat `CompanyIndex` (deteksi ticker/nama perusahaan di query dan indeks paragraf per perusahaan).
 - `finder_bm25/retrieval.py` memuat implementasi:
   - Caching embeddings: `_load_or_compute_embeddings()` (lazy load dari cache atau compute & save).
   - Encoding embeddings: `_encode_normalized_embeddings()` (compute normalized embeddings).
   - BM25 retrieval (`retrieve_topk`, `build_bm25`)
   - HyDE retrieval (`retrieve_topk_hyde`, `build_hyde_retriever`, `build_hyde_llm`)
   - FAISS dense retrieval (`retrieve_topk_faiss`, `build_faiss_retriever`)
-  - Multipath Retrieval (`retrieve_multipath`, `_deduplicate_results`, `_expand_chunks_with_bundling`)
+  - Multipath Retrieval (`retrieve_multipath`, `_rrf_fuse`, `_bundle_neighbors`)
 - `finder_bm25/evaluation.py` memuat logika context recall dalam tiga mode (heuristic, ragas_nonllm, ragas_llm).
 
 ## Referensi Tambahan

@@ -32,12 +32,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hyde-num-hypothetical-docs", type=int, default=None, help="Number of hypothetical docs for HyDE")
     parser.add_argument("--chunk-expansion-similarity-threshold", type=float, default=None, help="Similarity threshold for chunk bundling in multipath retrieval (0.0-1.0)")
     parser.add_argument("--chunk-expansion-max-neighbors", type=int, default=None, help="Max neighbors to check for chunk bundling in multipath retrieval")
+    parser.add_argument("--rrf-k", type=int, default=None, help="Reciprocal Rank Fusion constant for multipath retrieval")
+    parser.add_argument("--multipath-candidates", type=int, default=None, help="Candidates per retriever before RRF fusion in multipath retrieval")
+    parser.add_argument(
+        "--company-filter",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Ablation: restrict retrieval to companies mentioned in the query (not comparable with FINDER baselines). Default off",
+    )
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-
+def build_config(args: argparse.Namespace) -> AppConfig:
     # Start from single source of truth in finder_bm25/settings.py
     config = AppConfig(**CONFIG.__dict__)
 
@@ -83,7 +89,19 @@ def main() -> None:
     if args.chunk_expansion_max_neighbors is not None:
         config.chunk_expansion_max_neighbors = args.chunk_expansion_max_neighbors
 
-    run_pipeline(config)
+    if args.rrf_k is not None:
+        config.rrf_k = args.rrf_k
+    if args.multipath_candidates is not None:
+        config.multipath_candidates_per_retriever = args.multipath_candidates
+    if args.company_filter is not None:
+        config.company_filter = args.company_filter
+
+    return config
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    run_pipeline(build_config(args))
 
 
 if __name__ == "__main__":

@@ -20,7 +20,10 @@ CONFIG = AppConfig(
     hyde_device="cuda",
     hyde_num_hypothetical_docs=3,
     chunk_expansion_similarity_threshold=0.85,
-    chunk_expansion_max_neighbors=5,    
+    chunk_expansion_max_neighbors=5,
+    rrf_k=60,
+    multipath_candidates_per_retriever=30,
+    company_filter=False,  # True = ablation "company routing" (tidak sebanding dengan baseline FINDER)
     eval_mode="ragas_llm",  # heuristic | ragas_llm | ragas_nonllm
     fuzzy_threshold=0.85,
     sample_percent=10.0,

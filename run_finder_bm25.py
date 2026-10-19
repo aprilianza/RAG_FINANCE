@@ -35,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rrf-k", type=int, default=None, help="Reciprocal Rank Fusion constant for multipath retrieval")
     parser.add_argument("--multipath-candidates", type=int, default=None, help="Candidates per retriever before RRF fusion in multipath retrieval")
     parser.add_argument(
+        "--metadata-header",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Index chunks with a company/fiscal-year/10-K-section header (default on). --no-metadata-header for the ablation",
+    )
+    parser.add_argument(
         "--company-filter",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -93,6 +99,8 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         config.rrf_k = args.rrf_k
     if args.multipath_candidates is not None:
         config.multipath_candidates_per_retriever = args.multipath_candidates
+    if args.metadata_header is not None:
+        config.metadata_header = args.metadata_header
     if args.company_filter is not None:
         config.company_filter = args.company_filter
 

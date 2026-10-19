@@ -7,7 +7,8 @@ from typing import List
 
 # Naikkan jika format korpus berubah agar cache korpus & embedding lama tidak terpakai.
 # v2: tabel 10-K disimpan sebagai teks (sebelumnya dibuang).
-CORPUS_VERSION = "v2"
+# v3: tiap chunk menyimpan header metadata (perusahaan, ticker, tahun fiskal, Item 10-K).
+CORPUS_VERSION = "v3"
 
 
 def load_env(env_path: Path | None = None) -> None:
@@ -64,6 +65,13 @@ class AppConfig:
     rrf_k: int = 60
     multipath_candidates_per_retriever: int = 30
 
+    # Index BM25/embedding dengan header metadata dokumen di depan tiap chunk
+    # (enrichment ala FinSage FFP). Pencarian tetap di seluruh korpus.
+    metadata_header: bool = True
+
+    # Versi format korpus; run lama yang dibaca ulang (rescore) memakai versinya sendiri.
+    corpus_version: str = CORPUS_VERSION
+
     # Batasi retrieval ke perusahaan yang disebut di query (ticker / nama).
     company_filter: bool = False
 
@@ -114,7 +122,8 @@ class AppConfig:
 
     @property
     def corpus_cache_path(self) -> Path:
-        return self.output_dir / f"corpus_paragraphs_{CORPUS_VERSION}.jsonl"
+        suffix = f"_{self.corpus_version}" if self.corpus_version else ""
+        return self.output_dir / f"corpus_paragraphs{suffix}.jsonl"
 
     @property
     def company_names_cache_path(self) -> Path:
@@ -125,13 +134,18 @@ class AppConfig:
         """Cache path untuk FAISS embeddings (numpy format)."""
         # Encode model name untuk avoid path issues (ganti '/' dengan '_')
         model_safe = self.embedding_model.replace("/", "_").replace("-", "_")
-        return self.output_dir / f"faiss_embeddings_{model_safe}_{CORPUS_VERSION}.npy"
+        return self.output_dir / f"faiss_embeddings_{model_safe}_{self.corpus_version}{self._header_suffix}.npy"
 
     @property
     def hyde_embeddings_cache_path(self) -> Path:
         """Cache path untuk HyDE embeddings (numpy format)."""
         model_safe = self.embedding_model.replace("/", "_").replace("-", "_")
-        return self.output_dir / f"hyde_embeddings_{model_safe}_{CORPUS_VERSION}.npy"
+        return self.output_dir / f"hyde_embeddings_{model_safe}_{self.corpus_version}{self._header_suffix}.npy"
+
+    @property
+    def _header_suffix(self) -> str:
+        # Embedding dengan dan tanpa header metadata disimpan terpisah.
+        return "_hdr" if self.metadata_header else ""
 
     @property
     def retrieval_details_path(self) -> Path:

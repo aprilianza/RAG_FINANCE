@@ -44,7 +44,7 @@ def write_comparison(base: AppConfig, results: list[dict], out_dir: Path) -> Non
         "",
         f"- Evaluator: {results[0]['eval_label']}",
         f"- Company filter: {'on (ablation)' if base.company_filter else 'off (full corpus)'}",
-        f"- Corpus: {base.corpus_cache_path.name}",
+        f"- Corpus: {base.corpus_cache_path.name} (metadata header {'on' if base.metadata_header else 'off'})",
         f"- Sample: {base.sample_percent}% (seed {base.sample_seed}), top-k {base.top_k}",
     ]
     if base.eval_mode != "heuristic":

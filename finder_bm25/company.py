@@ -8,7 +8,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .preprocess import Paragraph
+from .preprocess import Paragraph, extract_dei_value
 from .utils import tqdm
 
 
@@ -44,26 +44,13 @@ _NAME_SUFFIXES = {
 }
 _SUFFIX_PATTERN = r"(?:inc|incorporated|corp|corporation|company|co|ltd|plc|holdings|group)\b"
 
-_REGISTRANT_RE = re.compile(
-    r'name="dei:EntityRegistrantName"[^>]*>(.*?)</ix:nonNumeric>',
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _clean_tag_text(raw: str) -> str:
-    text = re.sub(r"<[^>]+>", " ", raw)
-    text = text.replace("&amp;", "&").replace("&#160;", " ").replace("&nbsp;", " ")
-    return re.sub(r"\s+", " ", text).strip()
-
-
 def extract_registrant_name(html_path: Path) -> str:
     """Ambil nama perusahaan dari tag inline XBRL dei:EntityRegistrantName."""
     with html_path.open("r", encoding="utf-8", errors="ignore") as f:
         head = f.read(3_000_000)
-    match = _REGISTRANT_RE.search(head)
-    if match is None:
-        match = _REGISTRANT_RE.search(html_path.read_text(encoding="utf-8", errors="ignore"))
-    return _clean_tag_text(match.group(1)) if match else ""
+    return extract_dei_value(head, "EntityRegistrantName") or extract_dei_value(
+        html_path.read_text(encoding="utf-8", errors="ignore"), "EntityRegistrantName"
+    )
 
 
 def load_or_build_company_names(

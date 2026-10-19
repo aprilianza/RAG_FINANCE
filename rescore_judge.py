@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -39,6 +40,11 @@ def load_config(config_path: Path) -> AppConfig:
     names = {f.name for f in dataclasses.fields(AppConfig)}
     kwargs = {k: v for k, v in payload.items() if k in names and k != "openrouter_api_key"}
     kwargs["root"] = Path(kwargs.get("root", "."))
+    # Run sebelum korpus v3 tidak menyimpan field ini; pakai nilai yang berlaku saat itu.
+    kwargs.setdefault("metadata_header", False)
+    if "corpus_version" not in kwargs:
+        m = re.search(r"corpus_paragraphs_(v\d+)\.jsonl$", payload.get("corpus_cache_path", ""))
+        kwargs["corpus_version"] = m.group(1) if m else ""
     return AppConfig(**kwargs)  # API key diambil dari env / .env
 
 

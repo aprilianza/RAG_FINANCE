@@ -51,7 +51,7 @@ except Exception:
         HuggingFacePipeline = None
         _LANGCHAIN_HF_AVAILABLE = False
 
-from .preprocess import Paragraph
+from .preprocess import Paragraph, index_text
 from .utils import tokenize, tqdm
 
 
@@ -173,8 +173,9 @@ def build_bm25(
     paragraphs: Sequence[Paragraph],
     k1: float = 1.2,
     b: float = 0.75,
+    use_header: bool = False,
 ) -> tuple[Any, list[list[str]]]:
-    """Build BM25 index dari corpus paragraf."""
+    """Build BM25 index dari corpus paragraf (opsional dengan header metadata)."""
     if BM25Okapi is None:
         raise RuntimeError(
             "Missing dependency 'rank_bm25'. "
@@ -182,7 +183,7 @@ def build_bm25(
         )
 
     tokenized_corpus = [
-        tokenize(p.text)
+        tokenize(index_text(p, use_header))
         for p in tqdm(paragraphs, desc="Tokenize corpus for BM25")
     ]
     bm25 = BM25Okapi(tokenized_corpus, k1=k1, b=b)
@@ -355,6 +356,7 @@ def build_hyde_retriever(
     model_name: str = "all-MiniLM-L6-v2",
     device: str = "cpu",
     cache_path: Any = None,
+    use_header: bool = False,
 ) -> tuple[Any, Any]:
     """
     Build HyDE retriever dengan local embedding model.
@@ -369,6 +371,7 @@ def build_hyde_retriever(
         model_name:  Sentence Transformer model untuk embedding.
         device:      'cpu' atau 'cuda'.
         cache_path:  Optional path untuk cache embeddings (numpy format).
+        use_header:  Embed header metadata + teks (bukan teks saja).
 
     Returns:
         (embedding_model, paragraph_embeddings)
@@ -382,7 +385,7 @@ def build_hyde_retriever(
     print(f"[INFO] Loading embedding model: {model_name}")
     embedding_model = SentenceTransformer(model_name, device=device)
 
-    paragraph_texts = [p.text for p in paragraphs]
+    paragraph_texts = [index_text(p, use_header) for p in paragraphs]
     
     if cache_path is not None:
         paragraph_embeddings = _load_or_compute_embeddings(
@@ -407,6 +410,7 @@ def build_faiss_retriever(
     model_name: str = "all-MiniLM-L6-v2",
     device: str = "cpu",
     cache_path: Any = None,
+    use_header: bool = False,
 ) -> tuple[Any, Any, np.ndarray]:
     """
     Build dense retriever berbasis FAISS dengan sentence-transformer embeddings.
@@ -419,6 +423,7 @@ def build_faiss_retriever(
         model_name:  Sentence Transformer model untuk embedding.
         device:      'cpu' atau 'cuda'.
         cache_path:  Optional path untuk cache embeddings (numpy format).
+        use_header:  Embed header metadata + teks (bukan teks saja).
     
     Returns:
         (embedding_model, faiss_index, paragraph_embeddings)
@@ -440,7 +445,7 @@ def build_faiss_retriever(
     print(f"[INFO] Loading embedding model for FAISS: {model_name}")
     embedding_model = SentenceTransformer(model_name, device=device)
 
-    paragraph_texts = [p.text for p in paragraphs]
+    paragraph_texts = [index_text(p, use_header) for p in paragraphs]
     
     if cache_path is not None:
         paragraph_embeddings = _load_or_compute_embeddings(
@@ -834,6 +839,7 @@ def retrieve_multipath(
                 paragraph_id=anchor.paragraph_id,
                 source_file=anchor.source_file,
                 text=" ".join(paragraphs[i].text for i in bundle),
+                header=anchor.header,
             ),
             score,
         ))

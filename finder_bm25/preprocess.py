@@ -19,6 +19,97 @@ class Paragraph:
     paragraph_id: str
     source_file: str
     text: str
+    # Metadata dokumen, mis. "[Applied Materials, Inc. (AMAT) | FY2024 | Item 7. ...]".
+    # Hanya dipakai untuk indexing (BM25/embedding); text tetap teks asli.
+    header: str = ""
+
+
+def index_text(paragraph: Paragraph, use_header: bool = True) -> str:
+    """Teks yang di-index: header metadata + teks asli (jika diaktifkan)."""
+    if use_header and paragraph.header:
+        return f"{paragraph.header}\n{paragraph.text}"
+    return paragraph.text
+
+
+# Judul baku Item Form 10-K; dipakai agar header konsisten antar perusahaan.
+TENK_ITEMS = {
+    "1": "Business",
+    "1A": "Risk Factors",
+    "1B": "Unresolved Staff Comments",
+    "1C": "Cybersecurity",
+    "2": "Properties",
+    "3": "Legal Proceedings",
+    "4": "Mine Safety Disclosures",
+    "5": "Market for Registrant's Common Equity, Related Stockholder Matters and Issuer Purchases of Equity Securities",
+    "6": "Reserved",
+    "7": "Management's Discussion and Analysis of Financial Condition and Results of Operations",
+    "7A": "Quantitative and Qualitative Disclosures About Market Risk",
+    "8": "Financial Statements and Supplementary Data",
+    "9": "Changes in and Disagreements with Accountants on Accounting and Financial Disclosure",
+    "9A": "Controls and Procedures",
+    "9B": "Other Information",
+    "9C": "Disclosure Regarding Foreign Jurisdictions that Prevent Inspections",
+    "10": "Directors, Executive Officers and Corporate Governance",
+    "11": "Executive Compensation",
+    "12": "Security Ownership of Certain Beneficial Owners and Management and Related Stockholder Matters",
+    "13": "Certain Relationships and Related Transactions, and Director Independence",
+    "14": "Principal Accountant Fees and Services",
+    "15": "Exhibits and Financial Statement Schedules",
+    "16": "Form 10-K Summary",
+}
+_ITEM_HEADING_RE = re.compile(r"^item\s*(\d{1,2}[a-c]?)\b\s*[.:\-\u2013\u2014]?", re.IGNORECASE)
+
+
+def detect_item_heading(text: str) -> str | None:
+    """Kembalikan "Item 7. <judul baku>" jika blok adalah heading Item 10-K."""
+    t = text.replace("\xa0", " ").strip()
+    if len(t) > 150:
+        return None
+    m = _ITEM_HEADING_RE.match(t)
+    if m is None:
+        return None
+    item = m.group(1).upper()
+    title = TENK_ITEMS.get(item)
+    if title is None:
+        return None
+    # Sisa teks harus kosong (judul di elemen lain) atau diawali judul baku,
+    # agar kalimat seperti "Item 7 of this report ..." tidak dianggap heading.
+    rest = t[m.end():].strip(" .:-–—[(").lower()
+    if rest and not rest.startswith(title.split()[0].lower()[:5]):
+        return None
+    return f"Item {item}. {title}"
+
+
+def extract_dei_value(html: str, name: str) -> str:
+    """Nilai tag inline XBRL dei:<name> (mis. EntityRegistrantName), tanpa tag HTML."""
+    m = re.search(
+        rf'name="dei:{name}"[^>]*>(.*?)</ix:non(?:Numeric|Fraction)>',
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if m is None:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", m.group(1))
+    text = text.replace("&amp;", "&").replace("&#160;", " ").replace("&nbsp;", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def extract_fiscal_year(html: str) -> str:
+    year = extract_dei_value(html, "DocumentFiscalYearFocus")
+    if re.fullmatch(r"(19|20)\d{2}", year):
+        return year
+    years = re.findall(r"\b(?:19|20)\d{2}\b", extract_dei_value(html, "DocumentPeriodEndDate"))
+    return years[-1] if years else ""
+
+
+def build_header(company: str, ticker: str, fiscal_year: str, section: str) -> str:
+    who = f"{company} ({ticker})" if company else ticker
+    parts = [who]
+    if fiscal_year:
+        parts.append(f"FY{fiscal_year}")
+    if section:
+        parts.append(section)
+    return "[" + " | ".join(parts) + "]"
 
 
 def looks_like_noise(text: str) -> bool:
@@ -133,10 +224,27 @@ def table_looks_like_noise(text: str) -> bool:
 
 
 def parse_10k_html_to_paragraphs(html_path: Path, show_progress: bool = False) -> list[str]:
+    return [text for text, _ in parse_10k_html(html_path, show_progress)[1]]
+
+
+def parse_10k_html(
+    html_path: Path,
+    show_progress: bool = False,
+) -> tuple[dict[str, str], list[tuple[str, str]]]:
+    """
+    Parse satu 10-K menjadi metadata dokumen dan daftar (chunk_text, section).
+
+    Metadata dibaca dari tag dei: sebelum ix:header dibuang, karena
+    DocumentFiscalYearFocus biasanya ada di bagian tersembunyi.
+    """
     if BeautifulSoup is None:
         raise RuntimeError("Missing dependency 'beautifulsoup4'.")
 
     html = html_path.read_text(encoding="utf-8", errors="ignore")
+    meta = {
+        "company": extract_dei_value(html, "EntityRegistrantName"),
+        "fiscal_year": extract_fiscal_year(html),
+    }
     soup = BeautifulSoup(html, "html.parser")
 
     for tag_name in ["script", "style", "noscript", "svg", "img"]:
@@ -159,8 +267,9 @@ def parse_10k_html_to_paragraphs(html_path: Path, show_progress: bool = False) -
     body = soup.body or soup
     blocks = body.find_all(["p", "div", "li", "h1", "h2", "h3", "h4"])
 
-    # (is_table, text)
-    raw_paragraphs: list[tuple[bool, str]] = []
+    # (is_table, text, section)
+    raw_paragraphs: list[tuple[bool, str, str]] = []
+    section = ""
     for block in tqdm(
         blocks,
         desc=f"Parse blocks {html_path.name}",
@@ -172,7 +281,7 @@ def parse_10k_html_to_paragraphs(html_path: Path, show_progress: bool = False) -
             txt = " ; ".join(rows)
             if table_looks_like_noise(txt):
                 continue
-            raw_paragraphs.append((True, "\n".join(rows)))
+            raw_paragraphs.append((True, "\n".join(rows), section))
             continue
 
         # Wrapper yang membungkus tabel akan menduplikasi isi tabel.
@@ -181,23 +290,25 @@ def parse_10k_html_to_paragraphs(html_path: Path, show_progress: bool = False) -
 
         txt = block.get_text(" ", strip=True)
         txt = re.sub(r"\s+", " ", txt).strip()
+        # Heading Item dicek sebelum filter noise (heading biasanya < 40 karakter).
+        heading = detect_item_heading(txt)
+        if heading is not None:
+            section = heading
         if looks_like_noise(txt):
             continue
-        raw_paragraphs.append((False, txt))
+        raw_paragraphs.append((False, txt, section))
 
     seen = set()
-    paragraphs: list[str] = []
-    for is_table, para in raw_paragraphs:
+    chunks: list[tuple[str, str]] = []
+    for is_table, para, para_section in raw_paragraphs:
         norm = normalize_text(para)
         if not norm or norm in seen:
             continue
         seen.add(norm)
-        if is_table:
-            paragraphs.extend(split_table_rows(para.split("\n")))
-        else:
-            paragraphs.extend(split_long_paragraph(para))
+        pieces = split_table_rows(para.split("\n")) if is_table else split_long_paragraph(para)
+        chunks.extend((piece, para_section) for piece in pieces)
 
-    return paragraphs
+    return meta, chunks
 
 
 def load_or_build_corpus(tenk_dir: Path, cache_path: Path, show_progress: bool = True) -> List[Paragraph]:
@@ -211,6 +322,7 @@ def load_or_build_corpus(tenk_dir: Path, cache_path: Path, show_progress: bool =
                         paragraph_id=obj["paragraph_id"],
                         source_file=obj["source_file"],
                         text=obj["text"],
+                        header=obj.get("header", ""),
                     )
                 )
         return paragraphs
@@ -223,14 +335,15 @@ def load_or_build_corpus(tenk_dir: Path, cache_path: Path, show_progress: bool =
     paragraph_counter = 0
 
     for html_file in tqdm(html_files, desc="Parse 10-K files", disable=not show_progress):
-        parsed = parse_10k_html_to_paragraphs(html_file, show_progress=False)
-        for text in parsed:
+        meta, chunks = parse_10k_html(html_file, show_progress=False)
+        for text, section in chunks:
             paragraph_counter += 1
             paragraphs.append(
                 Paragraph(
                     paragraph_id=f"p{paragraph_counter}",
                     source_file=html_file.name,
                     text=text,
+                    header=build_header(meta["company"], html_file.stem, meta["fiscal_year"], section),
                 )
             )
 
@@ -243,6 +356,7 @@ def load_or_build_corpus(tenk_dir: Path, cache_path: Path, show_progress: bool =
                         "paragraph_id": p.paragraph_id,
                         "source_file": p.source_file,
                         "text": p.text,
+                        "header": p.header,
                     },
                     ensure_ascii=False,
                 )

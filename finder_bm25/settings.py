@@ -23,6 +23,7 @@ CONFIG = AppConfig(
     chunk_expansion_max_neighbors=5,
     rrf_k=60,
     multipath_candidates_per_retriever=30,
+    metadata_header=True,  # False = ablation tanpa header metadata (setara korpus v2)
     company_filter=False,  # True = ablation "company routing" (tidak sebanding dengan baseline FINDER)
     eval_mode="ragas_llm",  # heuristic | ragas_llm | ragas_nonllm
     fuzzy_threshold=0.85,

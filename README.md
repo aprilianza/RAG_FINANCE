@@ -145,9 +145,25 @@ Saat pipeline dijalankan, file HTML 10-K akan diproses menjadi paragraf teks:
 - Teks dibersihkan dari spasi berlebih.
 - Paragraf terlalu panjang akan dipecah menjadi chunk yang lebih kecil.
 - Paragraf duplikat dan noise disaring.
-- Hasilnya disimpan ke cache `outputs/corpus_paragraphs_v2.jsonl`.
+- Setiap chunk diberi header metadata (lihat bagian berikut).
+- Hasilnya disimpan ke cache `outputs/corpus_paragraphs_v3.jsonl`.
 
-Sufiks `v2` (`CORPUS_VERSION` di `finder_bm25/config.py`) menandai format korpus. Cache lama `corpus_paragraphs.jsonl` (tanpa tabel) tidak dipakai lagi, sehingga run pertama setelah update akan mem-parsing ulang semua HTML dan menghitung ulang embedding.
+Sufiks versi (`CORPUS_VERSION` di `finder_bm25/config.py`) menandai format korpus: v1 tanpa tabel, v2 dengan tabel, v3 dengan tabel dan header metadata. Cache versi lama tidak dipakai lagi, sehingga run pertama setelah update akan mem-parsing ulang semua HTML dan menghitung ulang embedding.
+
+## Header Metadata (enrichment ala FinSage)
+
+Paragraf 10-K jarang menyebut nama perusahaannya sendiri ("the Company", "we"), sehingga query seperti "Backlog drivers for AMAT" mudah tertukar dengan paragraf backlog perusahaan lain. Saat preprocessing, setiap chunk diberi header:
+
+```text
+[Applied Materials, Inc. (AMAT) | FY2024 | Item 7. Management's Discussion and Analysis of Financial Condition and Results of Operations]
+```
+
+- Nama perusahaan diambil dari tag XBRL `dei:EntityRegistrantName`, ticker dari nama file, dan tahun fiskal dari `dei:DocumentFiscalYearFocus` (fallback: `dei:DocumentPeriodEndDate`).
+- Bagian dokumen dideteksi dari heading "Item 1A", "Item 7", dan seterusnya, lalu dinormalisasi ke judul baku Form 10-K.
+- BM25 dan embedding (FAISS, HyDE, Multipath) meng-index `header + teks`. **Tidak ada jalur retrieval baru**, dan pencarian tetap di seluruh korpus.
+- Teks yang dikirim ke judge dan dievaluasi tetap teks asli tanpa header. Header disimpan terpisah di field `header` pada `_retrieval_details.jsonl`.
+
+Setting ini adil terhadap baseline full corpus karena hanya mengubah korpus, bukan query atau label. Default aktif (`metadata_header=True`). Ablation tanpa header: `--no-metadata-header`. Chunk-nya identik dengan v3, hanya index tanpa header (setara korpus v2), dan embedding-nya di-cache terpisah (`*_v3.npy` vs `*_v3_hdr.npy`).
 
 ## Filter Perusahaan (ablation, default off)
 
@@ -171,15 +187,15 @@ Jika file cache ini sudah ada, pipeline akan memuat cache tersebut daripada pars
 
 Untuk retrieval method **HyDE** dan **FAISS**, embeddings dari seluruh corpus (~494K paragraphs) di-compute dan **otomatis disimpan ke cache** di folder `outputs/`:
 
-- **FAISS embeddings**: `outputs/faiss_embeddings_<model_name>_v2.npy`
-- **HyDE embeddings**: `outputs/hyde_embeddings_<model_name>_v2.npy`
+- **FAISS embeddings**: `outputs/faiss_embeddings_<model_name>_v3_hdr.npy`
+- **HyDE embeddings**: `outputs/hyde_embeddings_<model_name>_v3_hdr.npy`
 
 Caching dilakukan otomatis:
 
 1. **First run**: Embeddings dihitung dan disimpan ke `.npy` file (sekali saja).
 2. **Subsequent runs**: Embeddings dimuat langsung dari cache, menghemat waktu computation secara signifikan.
 
-Cache path dihasilkan berdasarkan nama model embedding dan versi korpus (e.g., `BAAI/bge-base-en-v1.5` menjadi `faiss_embeddings_BAAI_bge_base_en_v1.5_v2.npy`). Jika jumlah embedding di cache tidak sama dengan jumlah paragraf korpus, embedding dihitung ulang otomatis.
+Cache path dihasilkan berdasarkan nama model embedding dan versi korpus (e.g., `BAAI/bge-base-en-v1.5` menjadi `faiss_embeddings_BAAI_bge_base_en_v1.5_v3_hdr.npy`; tanpa `_hdr` jika `--no-metadata-header`). Jika jumlah embedding di cache tidak sama dengan jumlah paragraf korpus, embedding dihitung ulang otomatis.
 
 Jika ingin regenerate embeddings cache (misal ganti embedding model), cukup hapus file `.npy` yang sesuai di folder `outputs/`.
 
@@ -205,6 +221,7 @@ Saat ini default yang dipakai adalah:
 - `hyde_num_hypothetical_docs = 3`
 - `eval_mode = "ragas_llm"`
 - `openrouter_model = "deepseek/deepseek-v4.1-flash"`
+- `metadata_header = True` (`False` hanya untuk ablation)
 - `company_filter = False` (full corpus; `True` hanya untuk ablation)
 - `rrf_k = 60`
 - `multipath_candidates_per_retriever = 30`
@@ -308,18 +325,20 @@ Berikut argumen yang bisa dipakai melalui `run_finder_bm25.py`:
   - Konstanta Reciprocal Rank Fusion untuk multipath retrieval (default: 60).
 - `--multipath-candidates`
   - Jumlah kandidat per retriever sebelum fusion dalam multipath retrieval (default: 30).
+- `--metadata-header` / `--no-metadata-header`
+  - Index chunk dengan header metadata (default) atau tanpa header (ablation).
 - `--company-filter` / `--no-company-filter`
   - Aktifkan (ablation) atau nonaktifkan filter perusahaan. Default nonaktif.
 
 ## Menjalankan Ulang Semua Baseline
 
-Setelah korpus berubah (misalnya `corpus_paragraphs_v2.jsonl` yang kini berisi tabel), semua metode harus dijalankan ulang di korpus, sampel, dan judge yang sama:
+Setelah korpus berubah (misalnya `corpus_paragraphs_v3.jsonl` yang kini berisi tabel dan header metadata), semua metode harus dijalankan ulang di korpus, sampel, dan judge yang sama:
 
 ```powershell
-python run_baselines.py --experiment-name baselines_v2
+python run_baselines.py --experiment-name baselines_v3
 ```
 
-Semua run disimpan di `outputs/baselines_v2/`, plus `comparison.md` dan `comparison.csv`. Opsi lain dari `run_finder_bm25.py` tetap berlaku (mis. `--sample-percent`, `--openrouter-model`, `--company-filter`). Pilih subset metode dengan `--methods bm25 faiss`. Untuk ablation filter perusahaan, jalankan sekali lagi dengan `--company-filter --experiment-name baselines_v2_company`.
+Semua run disimpan di `outputs/baselines_v3/`, plus `comparison.md` dan `comparison.csv`. Opsi lain dari `run_finder_bm25.py` tetap berlaku (mis. `--sample-percent`, `--openrouter-model`, `--company-filter`). Pilih subset metode dengan `--methods bm25 faiss`. Untuk ablation, jalankan sekali lagi dengan `--no-metadata-header --experiment-name baselines_v3_noheader` (tanpa header) atau `--company-filter --experiment-name baselines_v3_company` (filter perusahaan).
 
 ## Judge Gagal / Token Habis
 
@@ -328,8 +347,8 @@ Jika panggilan judge gagal (kuota/token OpenRouter habis, rate limit, output tid
 Isi skor yang hilang setelah kuota tersedia lagi, tanpa mengulang retrieval atau HyDE:
 
 ```powershell
-python rescore_judge.py outputs/baselines_v2 --dry-run   # lihat berapa baris yang akan dinilai
-python rescore_judge.py outputs/baselines_v2
+python rescore_judge.py outputs/baselines_v3 --dry-run   # lihat berapa baris yang akan dinilai
+python rescore_judge.py outputs/baselines_v3
 ```
 
 Skrip ini membuat backup `*_retrieval_details.jsonl.bak` sekali, menyimpan progres tiap 10 baris, berhenti sendiri jika judge gagal 5 kali berturut-turut, lalu menulis ulang `.md`, `.csv`, dan `comparison.md`. Jalankan ulang perintah yang sama untuk melanjutkan.

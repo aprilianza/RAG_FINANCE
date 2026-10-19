@@ -172,7 +172,8 @@ def write_run_summary(
     header = [
         f"- Evaluator: {eval_label(config)}",
         f"- Company filter: {company_line}",
-        f"- Corpus: {config.corpus_cache_path.name}",
+        f"- Corpus: {config.corpus_cache_path.name}"
+        f" (metadata header {'on' if config.metadata_header else 'off'})",
         f"- Queries: {n_queries} (sample {config.sample_percent}%, seed {config.sample_seed}), top-k {config.top_k}",
     ]
     if config.eval_mode != "heuristic":
@@ -274,6 +275,7 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
             model_name=config.embedding_model,
             device=config.hyde_device,
             cache_path=config.hyde_embeddings_cache_path,
+            use_header=config.metadata_header,
         )
         print(f"[INFO] Loading LLM pipeline (device={config.hyde_device})")
         gen_pipeline = build_hyde_llm(
@@ -289,6 +291,7 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
             model_name=config.embedding_model,
             device=config.hyde_device,
             cache_path=config.faiss_embeddings_cache_path,
+            use_header=config.metadata_header,
         )
         bm25 = None
         gen_pipeline = None
@@ -296,7 +299,7 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
         print("[INFO] Building Multi-Path Retriever (BM25 + FAISS + HyDE)...")
         # Build BM25
         print(f"[INFO] Building BM25 index (k1={config.bm25_k1}, b={config.bm25_b})")
-        bm25, _ = build_bm25(paragraphs, k1=config.bm25_k1, b=config.bm25_b)
+        bm25, _ = build_bm25(paragraphs, k1=config.bm25_k1, b=config.bm25_b, use_header=config.metadata_header)
         # Build FAISS
         print(f"[INFO] Building FAISS dense retriever with {config.embedding_model}")
         embedding_model, faiss_index, paragraph_embeddings = build_faiss_retriever(
@@ -304,6 +307,7 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
             model_name=config.embedding_model,
             device=config.hyde_device,
             cache_path=config.faiss_embeddings_cache_path,
+            use_header=config.metadata_header,
         )
         # Build HyDE
         print(f"[INFO] Loading LLM pipeline for HyDE (device={config.hyde_device})")
@@ -313,7 +317,7 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
         )
     else:
         print(f"[INFO] Building BM25 index (k1={config.bm25_k1}, b={config.bm25_b})")
-        bm25, _ = build_bm25(paragraphs, k1=config.bm25_k1, b=config.bm25_b)
+        bm25, _ = build_bm25(paragraphs, k1=config.bm25_k1, b=config.bm25_b, use_header=config.metadata_header)
         embedding_model = None
         paragraph_embeddings = None
         gen_pipeline = None
@@ -439,6 +443,7 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
                     "paragraph_id": p.paragraph_id,
                     "source_file": p.source_file,
                     "score": s,
+                    "header": p.header,
                     "text": p.text,
                 }
                 for p, s in topk

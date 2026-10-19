@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import gc
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 
-from finder_bm25 import run_pipeline
+from finder_bm25 import AppConfig, run_pipeline
 from finder_bm25.pipeline import markdown_table
 from run_finder_bm25 import build_config, build_parser
 
@@ -30,6 +31,56 @@ def _free_gpu_memory() -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+def write_comparison(base: AppConfig, results: list[dict], out_dir: Path) -> None:
+    """Tulis comparison.md / comparison.csv dari ringkasan beberapa metode."""
+    categories = base.target_categories
+    columns = {r["method"]: (r["category_scores"], r["total"]) for r in results}
+    heuristic_columns = {r["method"]: (r["heuristic_category_scores"], r["heuristic_total"]) for r in results}
+
+    sections = [
+        f"# Baseline comparison: {out_dir.name}",
+        "",
+        f"- Evaluator: {results[0]['eval_label']}",
+        f"- Company filter: {'on (ablation)' if base.company_filter else 'off (full corpus)'}",
+        f"- Corpus: {base.corpus_cache_path.name}",
+        f"- Sample: {base.sample_percent}% (seed {base.sample_seed}), top-k {base.top_k}",
+    ]
+    if base.eval_mode != "heuristic":
+        scored = ", ".join(f"{r['method']} {r['n_scored']}/{r['n_queries']}" for r in results)
+        sections.append(f"- Judge scored: {scored}")
+        if any(r["n_scored"] < r["n_queries"] for r in results):
+            sections.append(
+                "- WARNING: some queries have no judge score; their method averages cover only scored "
+                "queries. Fill them in with rescore_judge.py."
+            )
+    sections += [
+        "",
+        f"## Context Recall ({results[0]['eval_label']})",
+        "",
+        markdown_table(columns, categories),
+    ]
+    if base.eval_mode != "heuristic":
+        sections += ["", "## Context Recall (heuristic, deterministic)", "", markdown_table(heuristic_columns, categories)]
+    report = "\n".join(sections) + "\n"
+
+    (out_dir / "comparison.md").write_text(report, encoding="utf-8")
+
+    rows = []
+    for cat in categories + ["Total"]:
+        row = {"Category": cat}
+        for r in results:
+            row[r["method"]] = r["total"] if cat == "Total" else r["category_scores"][cat]
+            if base.eval_mode != "heuristic":
+                row[f"{r['method']} (heuristic)"] = (
+                    r["heuristic_total"] if cat == "Total" else r["heuristic_category_scores"][cat]
+                )
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(out_dir / "comparison.csv", index=False)
+
+    print("\n" + report)
+    print(f"[INFO] Saved comparison: {out_dir / 'comparison.md'}")
 
 
 def main() -> None:
@@ -53,44 +104,7 @@ def main() -> None:
         results.append(run_pipeline(config))
         _free_gpu_memory()
 
-    categories = base.target_categories
-    columns = {r["method"]: (r["category_scores"], r["total"]) for r in results}
-    heuristic_columns = {r["method"]: (r["heuristic_category_scores"], r["heuristic_total"]) for r in results}
-
-    sections = [
-        f"# Baseline comparison: {base.experiment_name}",
-        "",
-        f"- Evaluator: {results[0]['eval_label']}",
-        f"- Company filter: {'on (ablation)' if base.company_filter else 'off (full corpus)'}",
-        f"- Corpus: {base.corpus_cache_path.name}",
-        f"- Sample: {base.sample_percent}% (seed {base.sample_seed}), top-k {base.top_k}",
-        "",
-        f"## Context Recall ({results[0]['eval_label']})",
-        "",
-        markdown_table(columns, categories),
-    ]
-    if base.eval_mode != "heuristic":
-        sections += ["", "## Context Recall (heuristic, deterministic)", "", markdown_table(heuristic_columns, categories)]
-    report = "\n".join(sections) + "\n"
-
-    out_dir = base.output_dir / base.experiment_name
-    (out_dir / "comparison.md").write_text(report, encoding="utf-8")
-
-    rows = []
-    for cat in categories + ["Total"]:
-        row = {"Category": cat}
-        for r in results:
-            row[r["method"]] = r["total"] if cat == "Total" else r["category_scores"][cat]
-            if base.eval_mode != "heuristic":
-                row[f"{r['method']} (heuristic)"] = (
-                    r["heuristic_total"] if cat == "Total" else r["heuristic_category_scores"][cat]
-                )
-        rows.append(row)
-    pd.DataFrame(rows).to_csv(out_dir / "comparison.csv", index=False)
-
-    print("\n" + report)
-    print(f"[INFO] Saved comparison: {out_dir / 'comparison.md'}")
-
+    write_comparison(base, results, base.output_dir / base.experiment_name)
 
 if __name__ == "__main__":
     main()

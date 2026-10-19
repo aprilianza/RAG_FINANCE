@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import math
 from typing import Sequence
 
 from .utils import normalize_text, tokenize
@@ -91,8 +92,13 @@ def context_recall_ragas_llm(
     }
 
     ds = Dataset.from_dict(data)
-    result = evaluate(dataset=ds, metrics=[context_recall], llm=llm)
+    # raise_exceptions=True: tanpa ini RAGAS menelan error API (kuota habis,
+    # rate limit, output tak ter-parse) dan mengembalikan NaN.
+    result = evaluate(dataset=ds, metrics=[context_recall], llm=llm, raise_exceptions=True)
     val = float(result["context_recall"][0])
+    # min(100.0, nan) di Python bernilai 100.0, jadi NaN wajib ditolak eksplisit.
+    if math.isnan(val):
+        raise RuntimeError("RAGAS returned NaN context_recall (judge call failed or output unparsable)")
     return max(0.0, min(100.0, val * 100.0))
 
 
@@ -115,6 +121,8 @@ def context_recall_ragas_nonllm(
 
     metric = NonLLMContextRecall()
 
-    val = asyncio.run(metric.single_turn_ascore(sample))
+    val = float(asyncio.run(metric.single_turn_ascore(sample)))
+    if math.isnan(val):
+        raise RuntimeError("NonLLMContextRecall returned NaN")
 
-    return max(0.0, min(100.0, float(val) * 100.0))
+    return max(0.0, min(100.0, val * 100.0))

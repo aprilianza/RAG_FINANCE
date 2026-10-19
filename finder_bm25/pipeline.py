@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import asdict
 from datetime import datetime
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -59,17 +61,155 @@ def eval_label(config: AppConfig) -> str:
     return config.eval_mode
 
 
-def _aggregate(
-    per_category: dict[str, list[float]],
-    all_scores: list[float],
+METHOD_NAMES = {
+    "bm25": "BM25",
+    "hyde": "HyDE",
+    "faiss": "FAISS",
+    "multipath": "MPR",
+}
+
+# Setelah sekian kegagalan judge berturut-turut (mis. kuota/token habis),
+# panggilan judge dihentikan; retrieval tetap jalan dan skor judge diisi None.
+MAX_CONSECUTIVE_JUDGE_FAILURES = 5
+JUDGE_MAX_RETRIES = 3
+
+
+def score_with_judge(
+    config: AppConfig,
+    query: str,
+    references: list[str],
+    retrieved_texts: list[str],
+) -> float:
+    """Skor ragas_llm / ragas_nonllm (0-100). Melempar exception jika gagal."""
+    if config.eval_mode == "ragas_nonllm":
+        return context_recall_ragas_nonllm(references, retrieved_texts)
+
+    for attempt in range(1, JUDGE_MAX_RETRIES + 1):
+        try:
+            return context_recall_ragas_llm(
+                query=query,
+                references=references,
+                retrieved_texts=retrieved_texts,
+                api_key=config.openrouter_api_key,
+                endpoint=config.openrouter_endpoint,
+                model=config.openrouter_model,
+            )
+        except Exception as exc:
+            if attempt == JUDGE_MAX_RETRIES:
+                raise
+            print(
+                f"[WARN] RAGAS/OpenRouter attempt {attempt}/{JUDGE_MAX_RETRIES} failed. "
+                f"Retrying... Error: {exc}"
+            )
+            time.sleep(2 * attempt)
+    raise AssertionError("unreachable")
+
+
+def _mean_by_category(
+    records: list[dict[str, Any]],
+    key: str,
     categories: list[str],
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, int]:
+    """Rata-rata per kategori dan total; record dengan nilai None dilewati."""
+    per_category: dict[str, list[float]] = defaultdict(list)
+    values: list[float] = []
+    for rec in records:
+        val = rec.get(key)
+        if val is None:
+            continue
+        per_category[rec["category"]].append(float(val))
+        values.append(float(val))
     agg = {
         cat: float(sum(per_category[cat]) / len(per_category[cat])) if per_category.get(cat) else float("nan")
         for cat in categories
     }
-    total = float(sum(all_scores) / len(all_scores)) if all_scores else 0.0
-    return agg, total
+    total = float(sum(values) / len(values)) if values else float("nan")
+    return agg, total, len(values)
+
+
+def summarize_records(
+    config: AppConfig,
+    records: list[dict[str, Any]],
+    method_name: str,
+) -> dict[str, Any]:
+    agg, total, n_scored = _mean_by_category(records, "score", config.target_categories)
+    heuristic_agg, heuristic_total, _ = _mean_by_category(records, "heuristic_score", config.target_categories)
+    return {
+        "method": method_name,
+        "eval_label": eval_label(config),
+        "category_scores": agg,
+        "total": total,
+        "heuristic_category_scores": heuristic_agg,
+        "heuristic_total": heuristic_total,
+        "n_queries": len(records),
+        "n_scored": n_scored,
+        "n_filtered": sum(1 for r in records if r.get("company_filter_applied")),
+    }
+
+
+def write_run_summary(
+    config: AppConfig,
+    records: list[dict[str, Any]],
+    method_name: str,
+    markdown_out_path: Path,
+    csv_out_path: Path,
+    retrieval_details_path: Path,
+) -> dict[str, Any]:
+    """Tulis tabel .md, ringkasan .csv, dan detail .jsonl dari record per query."""
+    summary = summarize_records(config, records, method_name)
+    n_queries, n_scored = summary["n_queries"], summary["n_scored"]
+
+    columns = {f"{method_name} (Context Recall)": (summary["category_scores"], summary["total"])}
+    if config.eval_mode != "heuristic":
+        columns[f"{method_name} (Heuristic)"] = (summary["heuristic_category_scores"], summary["heuristic_total"])
+    md_table = markdown_table(columns, config.target_categories)
+
+    company_line = (
+        f"on (ablation, applied to {summary['n_filtered']}/{n_queries} queries)"
+        if config.company_filter
+        else "off (full corpus)"
+    )
+    header = [
+        f"- Evaluator: {eval_label(config)}",
+        f"- Company filter: {company_line}",
+        f"- Corpus: {config.corpus_cache_path.name}",
+        f"- Queries: {n_queries} (sample {config.sample_percent}%, seed {config.sample_seed}), top-k {config.top_k}",
+    ]
+    if config.eval_mode != "heuristic":
+        header.append(f"- Judge scored: {n_scored}/{n_queries}")
+        if n_scored < n_queries:
+            header.append(
+                f"- WARNING: {n_queries - n_scored} queries have no judge score; Context Recall above "
+                "averages only the scored ones. Fill them in with rescore_judge.py."
+            )
+    md_header = "\n".join(header)
+
+    print(f"\n=== {method_name} Context Recall (0-100) ===")
+    print(md_header)
+    print(md_table)
+    markdown_out_path.write_text(md_header + "\n\n" + md_table + "\n", encoding="utf-8")
+
+    rows = []
+    for cat in config.target_categories + ["Total"]:
+        row: dict[str, Any] = {
+            "Category": cat,
+            method_name: summary["total"] if cat == "Total" else summary["category_scores"][cat],
+        }
+        if config.eval_mode != "heuristic":
+            row[f"{method_name} (heuristic)"] = (
+                summary["heuristic_total"] if cat == "Total" else summary["heuristic_category_scores"][cat]
+            )
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(csv_out_path, index=False)
+
+    with retrieval_details_path.open("w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    print(f"\n[INFO] Saved markdown table: {markdown_out_path}")
+    print(f"[INFO] Saved csv summary: {csv_out_path}")
+    print(f"[INFO] Saved retrieval details: {retrieval_details_path}")
+    return summary
 
 
 def run_pipeline(config: AppConfig) -> dict[str, Any]:
@@ -77,13 +217,7 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
     config.output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    method_name_map = {
-        "bm25": "BM25",
-        "hyde": "HyDE",
-        "faiss": "FAISS",
-        "multipath": "MPR",
-    }
-    method_name = method_name_map[config.retrieval_method]
+    method_name = METHOD_NAMES[config.retrieval_method]
     method_name_lower = config.retrieval_method
     run_prefix = f"{method_name_lower}_context_recall_{timestamp}"
     fallback_experiment_name = f"experiment_{timestamp}"
@@ -185,11 +319,9 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
         gen_pipeline = None
         faiss_index = None
 
-    per_category_scores: dict[str, list[float]] = defaultdict(list)
-    all_scores: list[float] = []
-    per_category_heuristic: dict[str, list[float]] = defaultdict(list)
-    all_heuristic: list[float] = []
     retrieval_records: list[dict[str, Any]] = []
+    consecutive_judge_failures = 0
+    judge_skip_reason: str | None = None
 
     print(f"[INFO] Evaluating context recall with mode: {config.eval_mode}")
     for i, row in tqdm(
@@ -266,50 +398,32 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
             retrieved_texts,
             fuzzy_threshold=config.fuzzy_threshold,
         )
-        per_category_heuristic[category].append(heuristic_score)
-        all_heuristic.append(heuristic_score)
 
+        # Skor judge yang gagal disimpan sebagai None (bukan 0/100) agar bisa
+        # dinilai ulang dengan rescore_judge.py tanpa mengulang retrieval.
+        score: float | None = None
+        eval_error: str | None = None
         if config.eval_mode == "heuristic":
             score = heuristic_score
-        elif config.eval_mode == "ragas_nonllm":
-            try:
-                score = context_recall_ragas_nonllm(references, retrieved_texts)
-            except Exception as exc:
-                print(
-                    f"[ERROR] NonLLMContextRecall failed at row {i}. Error: {exc}"
-                )
-                raise
+        elif judge_skip_reason is not None:
+            eval_error = judge_skip_reason
         else:
-            max_retries = 3
-            for attempt in range(1, max_retries + 1):
-                try:
-                    score = context_recall_ragas_llm(
-                        query=query,
-                        references=references,
-                        retrieved_texts=retrieved_texts,
-                        api_key=config.openrouter_api_key,
-                        endpoint=config.openrouter_endpoint,
-                        model=config.openrouter_model,
+            try:
+                score = score_with_judge(config, query, references, retrieved_texts)
+                consecutive_judge_failures = 0
+            except Exception as exc:
+                eval_error = f"{type(exc).__name__}: {exc}"
+                consecutive_judge_failures += 1
+                print(f"[WARN] Judge failed at row {i}: {eval_error}")
+                if consecutive_judge_failures >= MAX_CONSECUTIVE_JUDGE_FAILURES:
+                    judge_skip_reason = (
+                        f"skipped: judge failed {consecutive_judge_failures} times in a row "
+                        f"(last error: {eval_error})"
                     )
-                    break
-                except Exception as exc:
-                    if attempt < max_retries:
-                        print(
-                            f"[WARN] RAGAS/OpenRouter failed at row {i}, "
-                            f"attempt {attempt}/{max_retries}. Retrying... Error: {exc}"
-                        )
-                        import time
-                        time.sleep(2)
-                    else:
-                        print(
-                            f"[ERROR] RAGAS/OpenRouter failed at row {i} "
-                            f"after {max_retries} attempts. Error: {exc}"
-                        )
-                        raise
-
-        score = max(0.0, min(100.0, float(score)))
-        per_category_scores[category].append(score)
-        all_scores.append(score)
+                    print(
+                        f"[ERROR] {judge_skip_reason}. Remaining queries are retrieved and "
+                        "scored with heuristic only; fill in judge scores later with rescore_judge.py."
+                    )
 
         record = {
             "query_index": int(i),
@@ -330,47 +444,24 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
                 for p, s in topk
             ],
         }
+        if eval_error is not None:
+            record["eval_error"] = eval_error
         if hypothetical_docs is not None:
             record["hypothetical_documents"] = hypothetical_docs
         retrieval_records.append(record)
 
-    agg, total = _aggregate(per_category_scores, all_scores, config.target_categories)
-    heuristic_agg, heuristic_total = _aggregate(per_category_heuristic, all_heuristic, config.target_categories)
-
-    n_filtered = sum(1 for r in retrieval_records if r["company_filter_applied"])
     if company_index is not None:
+        n_filtered = sum(1 for r in retrieval_records if r["company_filter_applied"])
         print(f"[INFO] Company filter applied to {n_filtered}/{len(retrieval_records)} queries")
 
-    columns = {f"{method_name} (Context Recall)": (agg, total)}
-    if config.eval_mode != "heuristic":
-        columns[f"{method_name} (Heuristic)"] = (heuristic_agg, heuristic_total)
-    md_table = markdown_table(columns, config.target_categories)
-    md_header = "\n".join([
-        f"- Evaluator: {eval_label(config)}",
-        f"- Company filter: {'on (ablation, applied to ' + str(n_filtered) + '/' + str(len(retrieval_records)) + ' queries)' if config.company_filter else 'off (full corpus)'}",
-        f"- Corpus: {config.corpus_cache_path.name}",
-        f"- Queries: {len(retrieval_records)} (sample {config.sample_percent}%, seed {config.sample_seed}), top-k {config.top_k}",
-    ])
-    print(f"\n=== {method_name} Context Recall (0-100) ===")
-    print(md_header)
-    print(md_table)
-
-    markdown_out_path.write_text(md_header + "\n\n" + md_table + "\n", encoding="utf-8")
-
-    rows = []
-    for cat in config.target_categories + ["Total"]:
-        row: dict[str, Any] = {
-            "Category": cat,
-            method_name: total if cat == "Total" else agg[cat],
-        }
-        if config.eval_mode != "heuristic":
-            row[f"{method_name} (heuristic)"] = heuristic_total if cat == "Total" else heuristic_agg[cat]
-        rows.append(row)
-    pd.DataFrame(rows).to_csv(csv_out_path, index=False)
-
-    with retrieval_details_path.open("w", encoding="utf-8") as f:
-        for rec in retrieval_records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    summary = write_run_summary(
+        config,
+        retrieval_records,
+        method_name,
+        markdown_out_path,
+        csv_out_path,
+        retrieval_details_path,
+    )
 
     config_payload = asdict(config)
     # Jangan tulis API key ke folder outputs (ikut ter-commit ke git).
@@ -392,17 +483,7 @@ def run_pipeline(config: AppConfig) -> dict[str, Any]:
     with config_out_path.open("w", encoding="utf-8") as f:
         json.dump(config_payload, f, ensure_ascii=False, indent=2)
 
-    print(f"\n[INFO] Saved markdown table: {markdown_out_path}")
-    print(f"[INFO] Saved csv summary: {csv_out_path}")
-    print(f"[INFO] Saved retrieval details: {retrieval_details_path}")
     print(f"[INFO] Saved run config: {config_out_path}")
 
-    return {
-        "method": method_name,
-        "eval_label": eval_label(config),
-        "category_scores": agg,
-        "total": total,
-        "heuristic_category_scores": heuristic_agg,
-        "heuristic_total": heuristic_total,
-        "experiment_dir": experiment_dir,
-    }
+    summary["experiment_dir"] = experiment_dir
+    return summary

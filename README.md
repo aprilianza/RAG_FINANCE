@@ -188,6 +188,7 @@ Jika ingin regenerate embeddings cache (misal ganti embedding model), cukup hapu
 Ada dua file yang bisa dipakai untuk menjalankan pipeline:
 
 - `run_finder_bm25.py` -> entrypoint utama yang direkomendasikan.
+- `rescore_judge.py` -> mengisi ulang skor judge yang hilang/tidak valid dari `_retrieval_details.jsonl` tanpa mengulang retrieval.
 - `run_baselines.py` -> menjalankan BM25, FAISS, HyDE, dan Multipath dengan konfigurasi, korpus, sampel, dan judge yang sama, lalu menulis `comparison.md` dan `comparison.csv`.
 - `main.py` -> launcher kompatibel lama yang memanggil `run_finder_bm25.py`.
 
@@ -320,6 +321,27 @@ python run_baselines.py --experiment-name baselines_v2
 
 Semua run disimpan di `outputs/baselines_v2/`, plus `comparison.md` dan `comparison.csv`. Opsi lain dari `run_finder_bm25.py` tetap berlaku (mis. `--sample-percent`, `--openrouter-model`, `--company-filter`). Pilih subset metode dengan `--methods bm25 faiss`. Untuk ablation filter perusahaan, jalankan sekali lagi dengan `--company-filter --experiment-name baselines_v2_company`.
 
+## Judge Gagal / Token Habis
+
+Jika panggilan judge gagal (kuota/token OpenRouter habis, rate limit, output tidak ter-parse), skor query itu disimpan sebagai `null` dengan pesan di `eval_error`. Skornya **tidak** dihitung sebagai 0 atau 100. Setelah 5 kegagalan berturut-turut, judge tidak dipanggil lagi, tetapi retrieval dan skor heuristic tetap berjalan sampai selesai. File `.md` dan `comparison.md` menampilkan `Judge scored: X/N` dan peringatan jika ada skor yang hilang. Rata-rata Context Recall hanya dihitung dari query yang punya skor.
+
+Isi skor yang hilang setelah kuota tersedia lagi, tanpa mengulang retrieval atau HyDE:
+
+```powershell
+python rescore_judge.py outputs/baselines_v2 --dry-run   # lihat berapa baris yang akan dinilai
+python rescore_judge.py outputs/baselines_v2
+```
+
+Skrip ini membuat backup `*_retrieval_details.jsonl.bak` sekali, menyimpan progres tiap 10 baris, berhenti sendiri jika judge gagal 5 kali berturut-turut, lalu menulis ulang `.md`, `.csv`, dan `comparison.md`. Jalankan ulang perintah yang sama untuk melanjutkan.
+
+**Run lama (sebelum perbaikan ini)**: kegagalan judge berubah menjadi skor 100, karena RAGAS mengembalikan NaN dan `min(100.0, nan)` di Python bernilai `100.0`. Untuk run seperti itu, tentukan baris yang dinilai ulang secara manual. Misalnya pada `outputs/baselines_20261018_155709`, semua query mulai posisi 346 bernilai 100 setelah token habis:
+
+```powershell
+python rescore_judge.py outputs/baselines_20261018_155709 --from-index 346
+```
+
+Opsi `--scores 100` menilai ulang semua baris yang bernilai persis 100, termasuk kemungkinan kegagalan sporadis sebelum posisi tersebut. Run lama dengan skor 100 di semua query (mis. `experiment_20260919_110630`) kemungkinan besar terkena bug yang sama dan tidak valid.
+
 ## Mode Evaluasi
 
 Apa pun mode yang dipilih, skor `heuristic` selalu ikut dihitung sebagai pembanding deterministik. Skornya muncul sebagai kolom tambahan di `.md` dan `.csv`, dan sebagai `heuristic_score` per query di `_retrieval_details.jsonl`. Header file `.md` mencatat evaluator (termasuk model judge), status filter perusahaan, versi korpus, dan ukuran sampel.
@@ -338,7 +360,7 @@ Ini adalah mode paling ringan dan cocok untuk eksperimen cepat.
 
 Mode ini memakai metrik `NonLLMContextRecall` dari `ragas`.
 
-Jika mode ini gagal pada salah satu query, pipeline berhenti dengan error (tidak ada fallback).
+Jika mode ini gagal pada salah satu query, skornya disimpan sebagai `null` (lihat "Judge Gagal / Token Habis").
 
 ### 3. `ragas_llm`
 
@@ -352,7 +374,7 @@ Mode ini membutuhkan:
 - API key OpenRouter
 - paket `ragas`, `datasets`, dan `langchain-openai`
 
-Jika evaluasi LLM gagal, pipeline mencoba ulang hingga 3 kali lalu berhenti dengan error (tidak ada fallback ke `heuristic`).
+Jika evaluasi LLM gagal, pipeline mencoba ulang hingga 3 kali; jika tetap gagal, skornya disimpan sebagai `null` dan bisa diisi ulang dengan `rescore_judge.py`.
 
 ### 4. `faiss`
 
@@ -548,7 +570,7 @@ Pastikan:
 - Endpoint OpenRouter benar.
 - Paket `ragas`, `datasets`, dan `langchain-openai` tersedia.
 
-Jika tetap gagal setelah 3 kali percobaan, pipeline berhenti dengan error pada query tersebut.
+Jika tetap gagal setelah 3 kali percobaan, skor query tersebut disimpan sebagai `null` dan run tetap berjalan. Lihat bagian "Judge Gagal / Token Habis" untuk mengisinya kembali dengan `rescore_judge.py`.
 
 ### 6. Hasil terlalu lambat
 

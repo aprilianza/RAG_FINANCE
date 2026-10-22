@@ -2,22 +2,23 @@
 
 - Evaluator: ragas_llm (judge: deepseek/deepseek-v4.1-flash)
 - Company filter: off (full corpus)
-- Corpus: corpus_paragraphs_v2.jsonl
+- Corpus: corpus_paragraphs_v2.jsonl (metadata header off)
 - Sample: 10.0% (seed 42), top-k 10
+- Judge scored: MPR 570/570
 
 ## Context Recall (ragas_llm (judge: deepseek/deepseek-v4.1-flash))
 
 | Category | MPR |
 |---|---:|
-| Accounting | 39.74 |
-| Company Overview | 50.39 |
-| Financials | 41.17 |
-| Footnotes | 49.20 |
-| Governance | 53.91 |
-| Legal | 52.06 |
-| Risk | 50.24 |
-| Shareholder Return | 49.46 |
-| Total | 48.17 |
+| Accounting | 14.59 |
+| Company Overview | 18.74 |
+| Financials | 10.30 |
+| Footnotes | 13.65 |
+| Governance | 8.58 |
+| Legal | 22.01 |
+| Risk | 13.62 |
+| Shareholder Return | 19.34 |
+| Total | 14.68 |
 
 ## Context Recall (heuristic, deterministic)
 
